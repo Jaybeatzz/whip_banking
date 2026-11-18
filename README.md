@@ -1,0 +1,123 @@
+# whip_banking
+
+A full banking system for FiveM servers running the [WHIP framework](https://whipfx.net). Players can open bank accounts, move money, read statements, and carry PIN-protected debit cards, all through a themed NUI panel with controller support.
+
+> **Note:** This is a community resource made for WHIP. It is **not** an official WHIP release.
+
+![Debit card](web/assets/whip_debit_card.png)
+
+## Features
+
+- **Multiple accounts per character**: personal, savings, and shared accounts, each with its own account number (`WB-123456`).
+- **Deposits, withdrawals and transfers** with per-transaction limits.
+- **Two-step transfers**: the recipient is looked up and confirmed first, and the confirmation expires after 60 seconds.
+- **Statements**: a recent-activity view on the overview, plus a paginated full transaction history.
+- **Debit cards**: issue up to three cards per account, each with a four-digit PIN. Cards can be blocked, unblocked or revoked from the branch.
+- **Physical card item** (`whip_debit_card`) that lives in the player's inventory, with a custom 3D prop and a hand animation when it is used.
+- **Server-authoritative**: every client request goes through WHIP's `SecureCallback` / `SecureEvent` with rate limits and typed parameters. The server rechecks distance, session and account permissions on every action.
+- **Safe money handling**: request IDs make retries idempotent, one transaction runs per character at a time, and failed steps are refunded or reversed automatically. Anything that can't be reversed is logged for staff reconciliation.
+- **Controller and keyboard support** through WHIP's pad screen and on-screen keyboard.
+- **Follows the active WHIP theme** automatically.
+
+## Requirements
+
+| Dependency | Notes |
+|---|---|
+| [`whip_core`](https://whipfx.net) | Version 1.0 or newer (`whip_requires '1.0'`) |
+| [`oxmysql`](https://github.com/overextended/oxmysql) | Used for the card table |
+
+## Installation
+
+1. Copy the `whip_banking` folder into your server's `resources` directory.
+2. Add it to `server.cfg` **after** WHIP and oxmysql:
+
+   ```cfg
+   ensure oxmysql
+   ensure whip_core
+   ensure whip_banking
+   ```
+
+3. Start the server. The `whip_banking_cards` table is created automatically on first start, so there are no SQL files to import.
+
+## Usage
+
+- Walk up to a configured bank branch and use the **Open Bank** prompt, or type `/bank` while standing at a branch.
+- From the panel you can:
+  - **Overview**: balance, recent activity, and the Deposit / Withdraw / Transfer actions.
+  - **Accounts & cards**: open new accounts and issue or manage debit cards.
+  - **Transactions**: browse your full statement.
+- Press `Esc` (or the Close button) to leave. The server ends the session as soon as you move away from the terminal, enter a vehicle, or log out.
+
+### Debit cards
+
+1. At a branch, choose an account and issue a card with a four-digit PIN. The card is added to your inventory.
+2. Use the card item from your inventory to show it. The card is previewed and held in your hand.
+3. Three wrong PIN attempts lock the card for five minutes. PINs are stored salted and hashed (SHA-256), never in plain text.
+
+## Configuration
+
+### `config.lua`
+
+| Option | Description |
+|---|---|
+| `Terminals` | Table of bank branches. Each has `mode`, `coords`, and an optional `prompt` (`coords`, `heading`, `findWall`) for the in-world interaction prompt. |
+| `InteractionDistance` | How close (in metres) a player must be to a terminal. Default `2.0`. |
+| `MaxTransaction` | Default per-transaction limit at a branch. Default `100000`. |
+| `MaxAtmWithdrawal` | Default per-transaction ATM withdrawal limit. Default `10000`. |
+| `RoutingBucket` | Routing bucket players must be in to use banking. Default `0`. |
+| `CardProp` | Model, bone, offset, rotation and animation for the held debit card. |
+| `AtmModels` | ATM prop models (reserved for ATM support, see [Status](#status)). |
+| `CardInsertion` | Animation and attachment settings for inserting a card (reserved for ATM support). |
+
+Adding a branch is a single entry:
+
+```lua
+Terminals = {
+    legion_bank = {
+        mode = 'bank',
+        coords = vector3(149.91, -1040.46, 29.37),
+        prompt = { coords = vector3(149.65, -1041.15, 30.10), heading = 340.0, findWall = true }
+    },
+    -- add more branches here
+}
+```
+
+### In-game settings
+
+`settings.lua` registers a **Banking** page in WHIP's admin panel (`/whip → Settings`). Admins can change the branch and ATM withdrawal limits there without editing files, and the changes survive updates.
+
+## Project structure
+
+```
+whip_banking/
+├── fxmanifest.lua
+├── config.lua            # Terminals, limits, card prop
+├── settings.lua          # In-game admin settings page
+├── client/
+│   └── main.lua          # Prompts, NUI bridge, card preview and animation
+├── server/
+│   ├── main.lua          # Accounts, transactions, sessions, callbacks
+│   └── cards.lua         # Debit card storage, PINs, item registration
+├── stream/               # Debit card model, texture dictionary, ytyp
+└── web/                  # NUI: index.html, app.js, style.css, assets
+```
+
+## Security notes
+
+- The client never sends prices, balances or permissions. It only sends an account ID, an amount, and a request ID, and the server validates the rest.
+- Amounts use WHIP's `amount` type, so negative and out-of-range values are refused rather than clamped.
+- Banking sessions are tied to the character session and the player's position, and are cleared on logout and disconnect.
+- Cash is moved with WHIP's `ChargePlayer` / `RefundPlayer` and `AddItem`, and every multi-step action has a rollback path.
+
+## Status
+
+ATM-specific code is present in the server, client and UI (withdrawal-only mode, card insertion, PIN verification, quick-cash presets). The current build only registers **bank branch** terminals, so ATM props aren't wired to open the panel yet.
+
+## Credits
+
+- Author: **Jay**
+- Built on [WHIP](https://whipfx.net) and [oxmysql](https://github.com/overextended/oxmysql).
+
+## License
+
+No license has been specified yet. Add a `LICENSE` file before publishing. If you ship WHIP files with this resource, note that WHIP itself is LGPL-3.0.
