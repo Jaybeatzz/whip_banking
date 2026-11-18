@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Banking</title>
+  <style>
+    /* The FiveM game frame must stay visible around the panel and while it is closed. */
+    html, body { background: transparent !important; color-scheme: normal !important; }
+    #bank[hidden] { display: none !important; }
+  </style>
+  <link rel="stylesheet" href="https://cfx-nui-whip_core/html/css/fonts.css">
+  <link rel="stylesheet" href="https://cfx-nui-whip_core/html/css/base.css">
+  <link rel="stylesheet" href="style.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <main id="bank" aria-labelledby="title" tabindex="-1" hidden>
+    <header class="masthead">
+      <div class="identity">
+        <svg aria-hidden="true" class="bank-symbol" viewBox="0 0 24 24"><path d="M3 9h18L12 4 3 9Zm2 11h14M7 12v5m5-5v5m5-5v5"/></svg>
+        <h1 id="title">Banking</h1>
+      </div>
+      <div class="session-tools">
+        
+        <button id="close" type="button">Close <kbd>Esc</kbd></button>
+      </div>
+    </header>
+    <p id="notice" role="status" aria-live="polite"></p>
+    <div class="workspace">
+      <nav class="bank-nav" aria-label="Banking views">
+        <strong id="customer" class="sidebar-customer"></strong>
+        <button id="overview-nav" type="button" aria-current="page"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 4h6v6H4zm10 0h6v6h-6zM4 14h6v6H4zm10 0h6v6h-6z"/></svg>Overview</button>
+        <button id="accounts-nav" type="button">Accounts &amp; cards</button>
+        <button id="transactions-nav" type="button"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/></svg>Transactions</button>
+          <div class="account-picker">
+            <label for="account">Active account</label>
+            <select id="account"></select>
+            <span id="number"></span>
+            <span id="account-access"></span>
+            <button id="new-account" type="button">Open an account</button>
+
+          </div>
+        <div class="cash-block"><span>Cash on hand</span><strong id="cash"></strong></div>
+      </nav>
+      <div class="bank-main">
+      <aside class="account-rail" aria-label="Account and actions">
+        <section class="account-summary" aria-label="Account summary">
+          <header class="section-header">
+            <h2 id="account-overview-title">Account overview</h2>
+            <button id="refresh" type="button" aria-label="Refresh balances" title="Refresh balances"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5m-3.4-3A7 7 0 0 1 18 7l2 5M4 12l2 5a7 7 0 0 0 12.4-2"/></svg></button>
+          </header>
+
+          <div class="balance-block">
+            <span>Available balance</span><strong id="balance"></strong>
+          </div>
+          
+        </section>
+        <section class="movement" aria-labelledby="movement-title">
+          <h2 id="movement-title">Move money</h2>
+          <div id="actions" role="group" aria-label="Transaction type">
+            <button type="button" data-action="deposit"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 3v12m-4-4 4 4 4-4M5 15v5h14v-5"/></svg>Deposit</button>
+            <button type="button" data-action="withdraw"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M12 15V3m-4 4 4-4 4 4M5 15v5h14v-5"/></svg>Withdraw</button>
+            <button type="button" data-action="transfer"><svg aria-hidden="true" viewBox="0 0 24 24"><path d="M4 8h16m-4-4 4 4-4 4m4 4H4m4-4-4 4 4 4"/></svg>Transfer</button>
+          </div>
+          <form id="move" hidden>
+            <fieldset id="fields">
+              <div id="recipient-field">
+                <label for="recipient">Recipient account</label>
+                <input id="recipient" maxlength="16" placeholder="WB-123456" autocomplete="off" spellcheck="false">
+              </div>
+              <div>
+                <label for="amount">Amount in dollars</label>
+                <input id="amount" inputmode="numeric" autocomplete="off" maxlength="13" placeholder="0" required aria-describedby="limit">
+                <small id="limit"></small>
+                <div id="quick-cash" role="group" aria-label="Quick cash amounts" hidden>
+                  <button type="button" data-amount="100">$100</button>
+                  <button type="button" data-amount="250">$250</button>
+                  <button type="button" data-amount="500">$500</button>
+                </div>
+              </div>
+            </fieldset>
+            <div class="review-details" id="review" hidden>
+              <strong id="review-total"></strong>
+              <p id="review-note"></p>
+            </div>
+            <div class="form-actions">
+              <button id="submit" class="primary" type="submit">Review</button>
+              <button id="cancel" type="button">Cancel</button>
+            </div>
+          </form>
+        </section>
+
+      </aside>
+      <div class="content">
+        <section id="management" hidden aria-labelledby="management-title">
+          <h2 id="management-title">Accounts &amp; cards</h2>
+          <section class="new-account-section">
+            <h3>Open an account</h3>
+                        <form id="account-form" hidden>
+              <label for="account-name">Account name</label>
+              <input id="account-name" maxlength="50" required autocomplete="off">
+              <label for="account-kind">Account type</label>
+              <select id="account-kind"><option value="savings">Savings</option><option value="shared">Shared</option></select>
+              <button id="create-account" type="submit">Create account</button>
+              <button id="cancel-account" type="button">Cancel</button>
+            </form>
+          </section>
+                  <section class="cards" id="card-management" aria-labelledby="cards-title">
+          <h2 id="cards-title">Debit cards</h2>
+          <p id="card-status" role="status"></p>
+          <div id="card-list"></div>
+          <form id="card-form">
+            <label id="card-select-label" for="card-select">Card in your inventory</label>
+            <select id="card-select"></select>
+            <label id="pin-label" for="card-pin">Four-digit PIN</label>
+            <input id="card-pin" type="password" inputmode="numeric" pattern="[0-9]{4}" minlength="4" maxlength="4" autocomplete="off" required>
+            <button id="card-submit" type="submit">Issue debit card</button>
+          </form>
+        </section>
+        </section>
+        <section id="trend" aria-labelledby="trend-title" hidden>
+          <header class="section-header"><h2 id="trend-title">Balance history</h2><span id="trend-count"></span></header>
+          <figure id="trend-figure" hidden>
+            <div class="trend-grid">
+              <div class="trend-scale"><span id="trend-high"></span><span id="trend-low"></span></div>
+              <svg class="trend-plot" viewBox="0 0 480 118" preserveAspectRatio="none" aria-hidden="true">
+                <defs><linearGradient id="trend-fill" x2="0%" y2="100%"><stop offset="0" stop-color="currentColor" stop-opacity=".30"/><stop offset="1" stop-color="currentColor" stop-opacity="0"/></linearGradient></defs>
+                <path class="trend-gridlines" d="M0 8H480M0 59H480M0 110H480"/>
+                <path id="trend-area" fill="url(#trend-fill)" stroke="none"/>
+                <path id="trend-line" vector-effect="non-scaling-stroke"/>
+              </svg>
+            </div>
+            <figcaption><time id="trend-start"></time><time id="trend-end"></time></figcaption>
+          </figure>
+          <p id="trend-empty" hidden>Balance history will appear after more transactions.</p>
+        </section>
+        <section id="activity" aria-labelledby="activity-title">
+          <header class="section-header">
+            <h2 id="activity-title">Recent activity</h2>
+            <button id="statement" type="button">View statement</button>
+          </header>
+          <p id="empty" hidden></p>
+          <div class="table-scroll">
+            <table id="transactions">
+              <thead><tr><th scope="col">Transaction</th><th scope="col">Amount</th><th scope="col" id="running-balance">Balance</th></tr></thead>
+              <tbody id="entries"></tbody>
+            </table>
+          </div>
+          <nav id="pages" aria-label="Statement pages" hidden>
+            <button id="previous" type="button">Previous</button>
+            <span id="page"></span>
+            <button id="next" type="button">Next</button>
+          </nav>
+        </section>
+      </div>
+      </div>
+
+    </div>
+    <footer id="pad-hints" hidden>
+      <span><img src="https://cfx-nui-whip_core/html/img/pad/dpad.svg" alt="D-pad">Move</span>
+      <span><img src="https://cfx-nui-whip_core/html/img/pad/a.svg" alt="A">Select / edit</span>
+      <span><img src="https://cfx-nui-whip_core/html/img/pad/b.svg" alt="B">Back</span>
+      <span><img src="https://cfx-nui-whip_core/html/img/pad/lb.svg" alt="LB"><img src="https://cfx-nui-whip_core/html/img/pad/rb.svg" alt="RB">Account</span>
+      <span><img src="https://cfx-nui-whip_core/html/img/pad/x.svg" alt="X">Refresh</span>
+    </footer>
+    <div id="controller-dropdown" role="dialog" aria-modal="true" aria-labelledby="dropdown-title" hidden>
+      <div class="dropdown-panel">
+        <h2 id="dropdown-title">Select an option</h2>
+        <div id="dropdown-options" role="listbox" aria-labelledby="dropdown-title"></div>
+        <p><img src="https://cfx-nui-whip_core/html/img/pad/a.svg" alt="A">Confirm <img src="https://cfx-nui-whip_core/html/img/pad/b.svg" alt="B">Cancel</p>
+      </div>
+    </div>
+    <div id="pin-pad" role="dialog" aria-modal="true" aria-labelledby="pin-pad-title" hidden>
+      <div class="pin-panel">
+        <h2 id="pin-pad-title">Enter PIN</h2>
+        <output id="pin-display" aria-label="PIN digits entered"></output>
+        <div class="pin-keys">
+          <button type="button" data-digit="7">7</button><button type="button" data-digit="8">8</button><button type="button" data-digit="9">9</button>
+          <button type="button" data-digit="4">4</button><button type="button" data-digit="5">5</button><button type="button" data-digit="6">6</button>
+          <button type="button" data-digit="1">1</button><button type="button" data-digit="2">2</button><button type="button" data-digit="3">3</button>
+          <button type="button" id="pin-cancel">Cancel</button><button type="button" data-digit="0">0</button><button type="button" id="pin-delete">⌫</button>
+        </div>
+        <button type="button" id="pin-done">Done</button>
+        <p class="keypad-hints">
+          <span><img src="https://cfx-nui-whip_core/html/img/pad/a.svg" alt="A">Type</span>
+          <span><img src="https://cfx-nui-whip_core/html/img/pad/x.svg" alt="X">Delete</span>
+          <span><img src="https://cfx-nui-whip_core/html/img/pad/rb.svg" alt="RB">Done</span>
+          <span><img src="https://cfx-nui-whip_core/html/img/pad/b.svg" alt="B">Cancel</span>
+        </p>
+      </div>
+    </div>
+    <div id="controller-focus" aria-hidden="true" hidden><img src="https://cfx-nui-whip_core/html/img/pad/a.svg" alt=""></div>
+  </main>
+  <section id="card-preview" role="dialog" aria-modal="true" aria-labelledby="card-preview-title" hidden>
+    <div class="card-preview-panel">
+      <header class="section-header">
+        <h2 id="card-preview-title">Debit card</h2>
+        <button id="card-preview-close" type="button">Close <kbd>Esc / B</kbd></button>
+      </header>
+      <div class="card-art">
+        <img src="assets/whip_debit_card.png" alt="Debit card">
+        <div class="card-personalization">
+          <strong id="preview-account-number"></strong>
+          <span id="preview-account-name"></span>
+          <span id="preview-holder"></span>
+        </div>
+      </div>
+      <footer class="section-header">
+        <span id="preview-card-status"></span><span id="preview-last-four"></span>
+      </footer>
+      <p id="preview-error" role="status"></p>
+    </div>
+  </section>
+</body>
+</html>
