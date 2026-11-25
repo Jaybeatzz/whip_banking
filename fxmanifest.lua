@@ -4,7 +4,7 @@ lua54 'yes'
 
 author 'Jay'
 description 'Banking - Made for Whip this is not an Official Resource'
-version '2.0.0'
+version '2.1.0'
 
 dependency 'whip_core'
 whip_requires '1.0'
@@ -15,7 +15,7 @@ files { 'web/index.html', 'web/app.js', 'web/style.css', 'web/assets/whip_debit_
 shared_scripts { '@whip_core/lib/satellite.lua', 'config.lua', 'settings.lua' }
 client_script 'client/main.lua'
 dependency 'oxmysql'
-server_scripts { '@oxmysql/lib/MySQL.lua', 'server/cards.lua', 'server/main.lua' }
+server_scripts { '@oxmysql/lib/MySQL.lua', 'server/cards.lua', 'server/plus.lua', 'server/main.lua' }
 
 files { 'stream/banking_debit_card.ytyp' }
 data_file 'DLC_ITYP_REQUEST' 'stream/banking_debit_card.ytyp'

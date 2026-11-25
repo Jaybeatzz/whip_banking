@@ -39,13 +39,14 @@ local function release(tellServer)
     end
 end
 
-local function show(terminalKey, selectedAccountId)
+--- Open a branch (`open`, terminal key) or an ATM (`openAtm`, x, y, z): the server answers with the first snapshot.
+local function show(name, ...)
     if open or opening or waitingForRender or cardPreview then return end
     if Whip.core:IsAnyScreenOpen() or IsNuiFocused() then return end
     opening = true
     generation = generation + 1
     local version = generation
-    local snapshot, why = Whip.core:Callback(prefix .. 'open', terminalKey, tonumber(selectedAccountId) or 0)
+    local snapshot, why = Whip.core:Callback(prefix .. name, ...)
     opening = false
     if version ~= generation then return end
     if not snapshot then return Whip.core:Notify(why or 'The bank is unavailable.', 'error') end
@@ -83,11 +84,11 @@ local function mountTeller(key, terminal, version)
     local actionId = 'whip_banking_' .. key
     local ok, why = Whip.core:AddAction({
         id = actionId,
-        at = { coords = prompt.coords or terminal.coords, heading = prompt.heading },
+        at = { coords = prompt.coords or (terminal.coords + vector3(0.0, 0.0, 0.75)), heading = prompt.heading },
         focusMode = 'near', reach = Config.InteractionDistance, seeFrom = 4.5,
         scale = 0.70, label = 'Open Bank', icon = 'bank', press = true,
         require = { alive = true, vehicle = 'out' },
-        onSelect = function() show(key) end
+        onSelect = function() show('open', key, 0) end
     })
     if not ok then print(('[whip_banking] Teller %s: %s'):format(key, why)) return end
     if not prompt.findWall or not prompt.heading then return end
@@ -117,15 +118,32 @@ Whip.register(function()
     for key, terminal in pairs(Config.Terminals) do
         if terminal.mode == 'bank' then mountTeller(key, terminal, version) end
     end
-    Whip.core:RemoveAction('atm_card_reader')
+    -- ATMs are whip_core's own (its built-in ATM); this resource runs the branches.
 
+end)
 
+-- A blip on the map for every branch. Blips belong to this resource: FiveM removes them when it stops.
+CreateThread(function()
+    local b = Config.Blips
+    if not b or not b.enabled then return end
+    for _, terminal in pairs(Config.Terminals) do
+        if terminal.mode == 'bank' then
+            local blip = AddBlipForCoord(terminal.coords.x, terminal.coords.y, terminal.coords.z)
+            SetBlipSprite(blip, b.sprite)
+            SetBlipColour(blip, b.colour)
+            SetBlipScale(blip, b.scale)
+            SetBlipAsShortRange(blip, true)
+            BeginTextCommandSetBlipName('STRING')
+            AddTextComponentSubstringPlayerName(b.label)
+            EndTextCommandSetBlipName(blip)
+        end
+    end
 end)
 
 RegisterCommand('bank', function()
     local terminal = closest()
     if not terminal then return Whip.core:Notify('Move to a bank branch to use banking.', 'error') end
-    show(terminal)
+    show('open', terminal, 0)
 end, false)
 
 local function respond(cb, value, why)
@@ -170,7 +188,18 @@ RegisterNUICallback('editField', function(data, cb)
     local fields = {
         amount = { title = 'Amount in dollars', numeric = true, maxLength = 13 },
         recipient = { title = 'Recipient account', maxLength = 16, predict = false },
-        ['account-name'] = { title = 'Account name', maxLength = 50 }
+        ['account-name'] = { title = 'Account name', maxLength = 50 },
+        ['vault-name'] = { title = 'Vault name', maxLength = 40 },
+        ['vault-goal'] = { title = 'Savings goal in dollars', numeric = true, maxLength = 10 },
+        ['vault-amount'] = { title = 'Amount in dollars', numeric = true, maxLength = 10 },
+        ['vault-lock'] = { title = 'Lock for how many days', numeric = true, maxLength = 3 },
+        ['so-label'] = { title = 'What is it for', maxLength = 60 },
+        ['so-amount'] = { title = 'Amount each time', numeric = true, maxLength = 10 },
+        ['so-number'] = { title = 'Pay account number', maxLength = 16, predict = false },
+        ['so-runs'] = { title = 'How many payments (empty: until stopped)', numeric = true, maxLength = 4 },
+        ['card-limit'] = { title = 'Daily ATM limit (0 for none)', numeric = true, maxLength = 10 },
+        ['card-name'] = { title = 'Card name', maxLength = 24 },
+        ['atm-amount'] = { title = 'Cash amount', numeric = true, maxLength = 10 }
     }
     local opts = type(data) == 'table' and fields[data.field]
     if not opts then return respond(cb, false, 'This field is unavailable.') end
@@ -196,7 +225,29 @@ RegisterNUICallback('close', function(_, cb)
     respond(cb, true)
 end)
 
+local insertAnim = 0
 local calls = {
+    plus = function(data)
+        return Whip.core:Callback(prefix .. 'plus', data.action, type(data.args) == 'table' and data.args or {})
+    end,
+    insertCard = function(data)
+        local result, why = Whip.core:Callback(prefix .. 'insertCard', tonumber(data.accountId), data.cardId)
+        if not result then return false, why end
+        local insert = Config.CardInsertion
+        if Whip.core:LoadAnimDict(insert.dict) then
+            insertAnim = insertAnim + 1
+            local mine, ped = insertAnim, PlayerPedId()
+            TaskPlayAnim(ped, insert.dict, insert.clip, 4.0, -4.0, insert.duration, 48, 0.0, false, false, false)
+            SetTimeout(insert.duration, function()
+                if mine == insertAnim then StopAnimTask(ped, insert.dict, insert.clip, 2.0) end
+            end)
+        end
+        Wait(math.min(insert.duration, 1600))
+        return result
+    end,
+    ejectCard = function()
+        return Whip.core:Callback(prefix .. 'ejectCard')
+    end,
     issueCard = function(data)
         return Whip.core:Callback(prefix .. 'issueCard', tonumber(data.accountId), data.pin, data.requestId)
     end,

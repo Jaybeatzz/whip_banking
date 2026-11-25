@@ -1,880 +1,1070 @@
 'use strict';
+// whip_banking NUI: a bank branch (online-banking layout) and an ATM (a machine screen with soft keys).
+// Everything is drawn from `state` by render(); every money move asks the server through client/main.lua.
+// Text fields never take typing directly: they open whip's keyboard (editField), so the mouse and a controller
+// behave the same. The controller arrives as { action: 'pad', cmd, down } from Whip.padScreen.
 
-const el = id => document.getElementById(id);
-const bank = el('bank');
-const quickCash = [...document.querySelectorAll('[data-amount]')];
-const actions = [...document.querySelectorAll('[data-action]')];
-const currency = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
-const shortDates = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
-const dates = new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+const $ = id => document.getElementById(id);
+const app = $('app');
 const resource = window.GetParentResourceName?.() || location.hostname.replace(/^cfx-nui-/, '');
-const labels = { deposit: 'Deposit', withdraw: 'Withdrawal', transfer: 'Transfer' };
-let session;
+const usd = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 0 });
+const fmtDay = new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' });
+const fmtTime = new Intl.DateTimeFormat('en-US', { hour: 'numeric', minute: '2-digit' });
+const fmtFull = new Intl.DateTimeFormat('en-US', { dateStyle: 'medium', timeStyle: 'short' });
+const MOVE = { deposit: 'Deposit', withdraw: 'Withdraw', transfer: 'Transfer' };
+const DONE = { deposit: 'Deposited', withdraw: 'Withdrew', transfer: 'Sent' };
+const VIEWS = [
+  ['overview', 'Overview', 'M4 11 12 4l8 7v9h-5v-6H9v6H4z'],
+  ['accounts', 'Accounts', 'M3 9h18L12 4 3 9Zm2 11h14M7 12v5m5-5v5m5-5v5'],
+  ['cards', 'Cards', 'M3 6h18v12H3zM3 10h18M7 15h4'],
+  ['vaults', 'Vaults', 'M5 4h14v16H5zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6Zm0 0V7m0 8v2'],
+  ['payments', 'Payments', 'M4 8h16m-4-4 4 4-4 4m4 4H4m4-4-4 4 4 4'],
+  ['insights', 'Insights', 'M4 20V10m6 10V4m6 16v-7m4 7H2'],
+  ['statement', 'Statements', 'M7 3h7l5 5v13H7zM14 3v5h5M10 13h6M10 17h6'],
+];
+const VAULT_COLOURS = ['blue', 'green', 'gold', 'rose', 'violet', 'teal'];
+const EVERY = { 1: 'Every hour', 6: 'Every 6 hours', 24: 'Every day', 72: 'Every 3 days', 168: 'Every week' };
+
+let state = null;          // the open session, null when closed
 let latestGeneration = 0;
-let controllerActive = false;
-let editingField = false;
-let pinDraft = '';
-let pinReturn;
-let dropdownSelect = null;
-let dropdownIndex = 0;
+let pad = false;           // a controller is driving
+let editing = false;       // whip's keyboard is up
 let previewSequence = null;
 
+// ---------------------------------------------------------------- utils
+const h = v => String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const money = n => usd.format(Math.round(+n || 0));
+const signed = n => (n > 0 ? '+' : n < 0 ? '−' : '') + usd.format(Math.abs(Math.round(n)));
+const icon = d => `<svg aria-hidden="true" viewBox="0 0 24 24"><path d="${d}"/></svg>`;
+const whole = v => (/^\d+$/.test(String(v ?? '').trim()) ? Number(String(v).trim()) : 0);
+const uuid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
+const when = t => { const d = new Date(typeof t === 'number' ? t * 1000 : t); return Number.isNaN(d.getTime()) ? '' : d; };
+const relDay = t => { const d = when(t); if (!d) return ''; const days = Math.round((d - Date.now()) / 86400000);
+  if (Math.abs(d - Date.now()) < 3600000) return 'within the hour';
+  if (days === 0) return 'today, ' + fmtTime.format(d); if (days === 1) return 'tomorrow'; if (days === -1) return 'yesterday';
+  return fmtDay.format(d); };
+
 async function call(name, data = {}) {
-  let response;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 15000);
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15000);
+  let res;
   try {
-    response = await fetch('https://' + resource + '/' + name, {
-      method: 'POST',
-      signal: controller.signal,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    });
-    response = await response.json();
+    res = await (await fetch(`https://${resource}/${name}`, { method: 'POST', signal: ctrl.signal,
+      headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })).json();
   } catch {
-    const message = labels[name] ? 'No confirmation received. Check your statement or retry the same confirmation.'
-      : 'Banking did not respond. Try again.';
-    throw new Error(message);
-  } finally {
-    clearTimeout(timeout);
-  }
-  if (!response.ok) throw new Error(response.error?.message || 'The banking request could not be completed.');
-  return response.data;
+    throw new Error(MOVE[name] ? 'No confirmation came back. Check your statement before trying again.' : 'The bank did not answer. Try again.');
+  } finally { clearTimeout(timer); }
+  if (!res.ok) throw new Error(res.error?.message || 'That could not be completed.');
+  return res.data;
 }
+const plus = (action, args = {}) => call('plus', { action, args });
 
-function notice(text = '', kind = '') {
-  el('notice').dataset.kind = kind;
-  el('notice').textContent = text;
-}
+// ---------------------------------------------------------------- derived
+const snap = () => state.snapshot;
+const atm = () => snap().mode === 'atm';
+const account = () => snap().accounts.find(a => a.id === snap().selectedAccountId);
+const accountById = id => snap().accounts.find(a => a.id === String(id));
+const vaultIds = () => new Set((snap().plus?.vaults || []).map(v => String(v.id)));
+const everyday = () => snap().accounts.filter(a => !vaultIds().has(a.id));
+const cardsFor = id => (snap().cards || []).filter(c => String(c.accountId) === String(id));
+const typeName = a => ({ personal: 'Personal', savings: vaultIds().has(a.id) ? 'Vault' : 'Savings', shared: 'Shared', business: 'Business' }[a.type] || 'Account');
 
-function selected() {
-  return session.snapshot.accounts.find(account => account.id === session.snapshot.selectedAccountId);
-}
+function notice(text = '', kind = '') { state.notice = text ? { text, kind } : null; render(); }
 
-function theme(name) {
-  document.getElementById('whip-theme')?.remove();
-  if (typeof name !== 'string' || !/^[\w-]+$/.test(name)) return;
-  const link = document.createElement('link');
-  link.id = 'whip-theme';
-  link.rel = 'stylesheet';
-  link.href = 'https://cfx-nui-' + name + '/theme.css';
-  document.head.append(link);
-}
-
-function updateControls() {
-  const { snapshot, busy, action, confirmation, statement, stale, closing } = session;
-  const account = selected();
-  const locked = busy || closing;
-  el('account').disabled = locked || Boolean(confirmation) || snapshot.accounts.length < 2;
-  el('refresh').disabled = locked || Boolean(confirmation);
-  el('close').disabled = locked;
-  el('new-account').hidden = snapshot.mode === 'atm';
-  el('new-account').disabled = locked || Boolean(confirmation);
-  el('create-account').disabled = locked;
-  el('cancel-account').disabled = locked;
-  el('account-name').disabled = locked;
-  el('account-kind').disabled = locked;
-  const atm = snapshot.mode === 'atm';
-  const accountCards = (snapshot.cards || []).filter(card => String(card.accountId) === account?.id);
-  const carried = accountCards.filter(card => card.carried && card.status === 'active');
-  const unlocked = snapshot.atmAccountId === account?.id;
-  el('card-select-label').hidden = !atm || unlocked;
-  el('card-select').hidden = !atm || unlocked;
-  el('card-form').hidden = atm ? unlocked || !carried.length : !account || account.canWithdraw === false || account.frozen;
-  el('card-submit').textContent = atm ? 'Verify PIN' : 'Issue debit card';
-  el('pin-label').textContent = atm ? 'Four-digit PIN' : 'Choose a four-digit PIN';
-  el('card-submit').disabled = locked || stale;
-  el('card-pin').disabled = locked;
-  el('card-select').disabled = locked;
-  for (const button of el('card-list').querySelectorAll('button')) button.disabled = locked;
-  el('card-status').textContent = snapshot.cardError || (atm
-    ? unlocked ? 'Card verified for this account.' : carried.length ? 'Verify your card to withdraw cash.' : 'Carry an active debit card for this account. Cards are issued at a bank branch.'
-    : 'Cards are issued to your inventory.');
-
-  el('statement').disabled = locked || !account;
-  el('overview-nav').disabled = locked;
-  el('accounts-nav').disabled = locked;
-  el('accounts-nav').hidden = snapshot.mode === 'atm';
-  el('transactions-nav').disabled = locked || !account;
-  el('previous').disabled = locked || !statement || statement.page <= 1;
-  el('next').disabled = locked || !statement?.hasMore;
-  el('fields').disabled = locked || Boolean(confirmation);
-  el('fields').hidden = Boolean(confirmation);
-  el('submit').disabled = locked || stale;
-  el('cancel').disabled = locked;
-  let availablePresets = 0;
-  for (const button of quickCash) {
-    const amount = Number(button.dataset.amount);
-    button.hidden = !account || amount > Math.min(account.balance, snapshot.limit);
-    if (!button.hidden) availablePresets += 1;
-  }
-  el('quick-cash').hidden = snapshot.mode !== 'atm' || !availablePresets || Boolean(confirmation);
-  for (const button of actions) {
-    button.hidden = snapshot.mode === 'atm' && button.dataset.action !== 'withdraw';
-    button.disabled = locked || stale || !account || account.frozen || Boolean(confirmation)
-      || (snapshot.mode === 'atm' && snapshot.atmAccountId !== account?.id)
-      || (button.dataset.action === 'deposit' ? account.canDeposit === false : account.canWithdraw === false);
-    button.setAttribute('aria-pressed', String(button.dataset.action === action));
-  }
-}
-
-function renderTrend(snapshot) {
-  const points = snapshot.recent.slice().reverse().filter(item =>
-    Number.isFinite(item.balance) && Number.isFinite(Date.parse(item.date)));
-  const shown = points.length >= 2;
-  el('trend-figure').hidden = !shown;
-  el('trend-empty').hidden = shown;
-  el('trend-count').textContent = shown ? 'Last ' + points.length + ' posted balances' : '';
-  if (!shown) return;
-
-  const balances = points.map(item => item.balance);
-  const high = Math.max(...balances);
-  const low = Math.min(...balances);
-  const coordinates = balances.map((balance, index) => {
-    const x = index / (balances.length - 1) * 480;
-    const y = high === low ? 59 : 110 - (balance - low) / (high - low) * 102;
-    return x + ' ' + y;
-  });
-  const line = 'M' + coordinates.join(' L');
-  el('trend-line').setAttribute('d', line);
-  el('trend-area').setAttribute('d', line + ' V118 H0Z');
-  el('trend-high').textContent = currency.format(high);
-  el('trend-low').textContent = high === low ? '' : currency.format(low);
-  for (const [id, point] of [['trend-start', points[0]], ['trend-end', points[points.length - 1]]]) {
-    const time = el(id);
-    time.dateTime = point.date;
-    time.textContent = shortDates.format(new Date(point.date));
-  }
-}
-
-function renderActivity() {
-  const { snapshot, statement } = session;
-  const items = statement?.items ?? snapshot.recent;
-  const management = session.management && snapshot.mode !== 'atm';
-  el('management').hidden = !management;
-  el('activity').hidden = snapshot.mode === 'atm' || management;
-  el('accounts-nav').setAttribute('aria-current', management ? 'page' : 'false');
-  bank.dataset.view = management ? 'management' : statement ? 'transactions' : 'overview';
-  el('trend').hidden = snapshot.mode === 'atm' || Boolean(statement) || management;
-  el('overview-nav').setAttribute('aria-current', statement || management ? 'false' : 'page');
-  el('transactions-nav').setAttribute('aria-current', statement && !management ? 'page' : 'false');
-  if (!el('trend').hidden) renderTrend(snapshot);
-  el('activity-title').textContent = statement ? 'Account statement' : 'Recent activity';
-  el('statement').textContent = statement ? 'Back to activity' : 'View statement';
-  el('running-balance').hidden = !statement;
-  el('pages').hidden = !statement;
-  if (statement) el('page').textContent = 'Page ' + statement.page;
-
-  const rows = items.map(item => {
-    const row = document.createElement('tr');
-    const title = row.insertCell();
-    const date = document.createElement('time');
-    date.dateTime = item.date;
-    const when = new Date(item.date);
-    date.textContent = Number.isNaN(when.getTime()) ? '' : dates.format(when);
-    const description = document.createElement('span');
-    description.className = 'transaction-description';
-    description.textContent = item.description;
-    const sign = document.createElement('span');
-    sign.className = 'transaction-direction';
-    sign.setAttribute('aria-hidden', 'true');
-    sign.textContent = item.amount > 0 ? '↙' : item.amount < 0 ? '↗' : '–';
-    sign.classList.toggle('credit', item.amount > 0);
-    const details = document.createElement('div');
-    details.className = 'transaction-details';
-    details.append(description, date);
-    const entry = document.createElement('div');
-    entry.className = 'transaction-entry';
-    entry.append(sign, details);
-    title.append(entry);
-    const amount = row.insertCell();
-    amount.textContent = (item.amount > 0 ? '+' : '') + currency.format(item.amount);
-    amount.classList.toggle('credit', item.amount > 0);
-    if (statement) row.insertCell().textContent = item.balance == null ? '—' : currency.format(item.balance);
-    return row;
-  });
-  el('entries').replaceChildren(...rows);
-  el('empty').hidden = rows.length > 0;
-  el('empty').textContent = selected() ? 'No transactions to display.' : 'No personal accounts are available.';
-  el('transactions').hidden = rows.length === 0;
-}
-
-function renderSnapshot() {
-  const { snapshot } = session;
-  const account = selected();
-  const atm = snapshot.mode === 'atm';
-  bank.dataset.mode = snapshot.mode;
-  bank.classList.toggle('atm-unlocked', snapshot.mode === 'atm' && snapshot.atmAccountId === snapshot.selectedAccountId);
-  el('movement-title').textContent = atm ? 'Cash withdrawal' : 'Move money';
-  document.title = atm ? 'ATM' : 'Banking';
-  el('title').textContent = document.title;
-  el('customer').textContent = snapshot.characterName || '';
-  el('account').replaceChildren(...snapshot.accounts.map(item => new Option(item.name, item.id)));
-  if (!account) el('account').add(new Option('No personal accounts', ''));
-  el('account').value = account?.id ?? '';
-  el('account').classList.toggle('single-account', snapshot.accounts.length < 2);
-  el('balance').textContent = account ? currency.format(account.balance) : '—';
-  el('balance').classList.toggle('long-balance', el('balance').textContent.length >= 15);
-  el('number').textContent = account ? account.number + (account.frozen ? ' · Frozen' : '') : '';
-  el('account-access').textContent = account?.role
-    ? (account.type === 'business' ? 'Business account' : account.type === 'shared' ? 'Shared account' : 'Personal account') + ' · ' + account.role + ' access' : '';
-  el('account-form').hidden = !session.management;
-  el('cash').textContent = currency.format(snapshot.cash);
-  el('activity').hidden = atm;
-  const cardManagement = el('card-management');
-  if (atm) el('move').closest('.movement').before(cardManagement);
-  else el('management').append(cardManagement);
-  el('transactions-nav').hidden = atm;
-  el('limit').textContent = 'Limit per transaction: ' + currency.format(snapshot.limit);
-  renderCards();
-  renderActivity();
-  updateControls();
-}
-
-function renderCards() {
-  const account = selected();
-  const cards = (session.snapshot.cards || []).filter(card => String(card.accountId) === account?.id);
-  el('card-select').replaceChildren(...cards.filter(card => card.carried && card.status === 'active')
-    .map(card => new Option('Debit · ' + card.lastFour, card.cardId)));
-  const rows = cards.map(card => {
-    const row = document.createElement('div');
-    row.className = 'card-row';
-    const label = document.createElement('span');
-    label.textContent = 'Debit · ' + card.lastFour + ' · ' + card.status;
-    row.append(label);
-    if (session.snapshot.mode === 'bank') {
-      for (const action of [card.status === 'active' ? 'block' : 'unblock', 'revoke']) {
-        const button = document.createElement('button');
-        button.type = 'button';
-        button.dataset.card = card.cardId;
-        button.dataset.cardAction = action;
-        button.textContent = action[0].toUpperCase() + action.slice(1);
-        row.append(button);
-      }
-    }
-    return row;
-  });
-  el('card-list').replaceChildren(...rows);
-  el('card-pin').value = '';
-}
-
-async function reloadCards(current, message) {
-  current.snapshot = await call('getBankSnapshot', { accountId: selected().id });
-  if (session !== current) return;
-  current.statement = null;
-  setAction(null);
-  renderSnapshot();
-  notice(message, 'success');
-}
-
-function setAction(action, focus = false) {
-  session.action = action;
-  bank.classList.toggle('is-editing', Boolean(action));
-  session.confirmation = null;
-  el('move').reset();
-  el('move').hidden = !action;
-  el('review').hidden = true;
-  el('submit').textContent = 'Review';
-  el('recipient-field').hidden = action !== 'transfer';
-  el('recipient').required = action === 'transfer';
-  updateControls();
-  if (focus) el(action === 'transfer' ? 'recipient' : 'amount').focus();
-}
-
-async function run(work) {
-  const current = session;
-  if (!current || current.busy || current.closing) return;
+// ---------------------------------------------------------------- busy wrapper
+async function run(work, { quiet = false } = {}) {
+  const current = state;
+  if (!current || current.busy) return;
   current.busy = true;
-  updateControls();
-  try {
-    await work(current);
-  } catch (error) {
-    if (session === current) notice(error.message, 'error');
-  } finally {
-    if (session === current) {
-      current.busy = false;
-      updateControls();
-      if (current.focus) {
-        el(current.focus).focus();
-        current.focus = null;
-      }
-    }
-  }
+  if (!quiet) render();
+  try { await work(current); }
+  catch (e) { if (state === current) { current.notice = { text: e.message, kind: 'error' }; } }
+  finally { if (state === current) { current.busy = false; render(); } }
 }
 
-function refresh(accountId = selected()?.id) {
-  run(async current => {
-    notice('Updating balances…');
-    try {
-      const snapshot = await call('getBankSnapshot', { accountId });
-      if (session !== current) return;
-      current.snapshot = snapshot;
-      current.statement = null;
-      current.stale = false;
-      setAction(null);
-      renderSnapshot();
-      notice();
-    } catch (error) {
-      if (session === current) el('account').value = current.snapshot.selectedAccountId;
-      throw error;
-    }
-  });
-}
-
-function openStatement(page) {
-  run(async current => {
-    notice('Loading statement…');
-    const statement = await call('getStatement', { accountId: selected().id, page });
-    if (session !== current) return;
-    current.management = false;
-    current.statement = statement;
-    renderActivity();
-    notice();
-  });
-}
-
-function review(current) {
-  const input = el('amount').value.trim();
-  const amount = /^\d+$/.test(input) ? Number(input) : 0;
-  const account = selected();
-  const action = current.action;
-  const limit = current.snapshot.limit;
-  if (!account || current.stale) throw new Error('Refresh balances before continuing.');
-  if (amount < 1 || amount > limit) throw new Error('Enter a whole-dollar amount from $1 to ' + currency.format(limit) + '.');
-  const available = action === 'deposit' ? current.snapshot.cash : account.balance;
-  if (amount > available) throw new Error(action === 'deposit' ? 'You do not have enough cash.' : 'Your account balance is too low.');
-
-  const data = { accountId: account.id, amount, requestId: crypto.randomUUID() };
-  const accountNumber = el('recipient').value.trim().toUpperCase();
-  return { data, account, action, accountNumber };
-}
-
-async function buildConfirmation(current) {
-  const { data, account, action, accountNumber } = review(current);
-  const amount = currency.format(data.amount);
-  let details;
-  if (action === 'transfer') {
-    if (!/^WB-\d{6}$/.test(accountNumber)) throw new Error('Enter a recipient account number like WB-123456.');
-    notice('Checking recipient…');
-    const recipient = await call('resolveRecipient', { accountId: account.id, accountNumber, amount: data.amount });
-    if (session !== current) return;
-    data.recipientToken = recipient.token;
-    details = 'From ' + account.name + ' to ' + recipient.name + ' (' + recipient.maskedNumber + ').';
-  } else if (action === 'deposit') {
-    details = 'Cash deposit into ' + account.name + '.';
-  } else {
-    details = 'Cash withdrawal from ' + account.name + '.';
-  }
-  current.confirmation = data;
-  el('review-total').textContent = amount;
-  el('review-note').textContent = details;
-  el('review').hidden = false;
-  el('submit').textContent = 'Confirm ' + labels[action].toLowerCase();
-  current.focus = 'submit';
-  notice();
-}
-
-async function submit(current) {
-  const action = current.action;
-  const data = current.confirmation;
-  notice('Submitting ' + labels[action].toLowerCase() + '…');
-  await call(action, data);
-  if (session !== current) return;
-  setAction(null);
+async function reload(current, accountId = current.snapshot.selectedAccountId) {
+  const s = await call('getBankSnapshot', { accountId: accountId || 0 });
+  if (state !== current) return;
+  normalise(s);
+  current.snapshot = s;
   current.statement = null;
-  current.stale = true;
-  renderActivity();
-  const success = labels[action] + ' complete.';
-  notice(success + ' Updating balances…', 'success');
+  if (current.view === 'insights' || current.view === 'overview') setTimeout(loadInsights, 0);
+}
+
+function normalise(s) {
+  s.accounts = Array.isArray(s.accounts) ? s.accounts : [];
+  s.recent = Array.isArray(s.recent) ? s.recent : [];
+  s.cards = Array.isArray(s.cards) ? s.cards : [];
+  if (s.plus) for (const k of ['vaults', 'schedules']) s.plus[k] = Array.isArray(s.plus[k]) ? s.plus[k] : [];
+  if (s.plus && !s.plus.requests) s.plus.requests = { incoming: [], outgoing: [] };
+}
+
+// ---------------------------------------------------------------- fields (whip keyboard)
+async function editField(field, key, extra = {}) {
+  const current = state;
+  if (!current || editing || current.busy) return;
+  editing = true;
   try {
-    const snapshot = await call('getBankSnapshot', { accountId: data.accountId });
-    if (session !== current) return;
-    current.snapshot = snapshot;
-    current.stale = false;
-    renderSnapshot();
-    notice(success, 'success');
-  } catch {
-    if (session === current) notice(success + ' Select Refresh balances to update the display.', 'success');
+    const r = await call('editField', { field, value: String(current.form?.values?.[key] ?? ''), action: current.form?.action,
+      accountName: account()?.name, ...extra });
+    if (state === current && r && !r.cancelled && current.form) { current.form.values[key] = r.value ?? ''; current.form.error = null; }
+  } catch (e) { if (state === current && current.form) current.form.error = e.message; }
+  finally { editing = false; if (state === current) render(); }
+}
+
+// ---------------------------------------------------------------- forms (sheets)
+function openForm(kind, values = {}, extra = {}) {
+  state.form = { kind, values, step: 'edit', error: null, request: uuid(), ...extra };
+  state.notice = null;
+  render();
+  focusFirst('.sheet');
+}
+function closeForm() { state.form = null; render(); focusKey(state.returnKey); }
+
+const FORMS = {
+  move: {
+    title: f => MOVE[f.action],
+    body(f) {
+      const a = account(), limit = snap().limit;
+      const avail = f.action === 'deposit' ? snap().cash : a?.balance;
+      if (f.step === 'review') return review(money(f.values.amount), f.reviewNote, `Confirm ${MOVE[f.action].toLowerCase()}`);
+      return (f.action === 'transfer' ? field('recipient', 'number', 'To account', 'WB-123456') : '') +
+        field('amount', 'amount', 'Amount', '$0', `${f.action === 'deposit' ? 'Cash in your wallet' : 'Available'}: ${money(avail)} · limit ${money(limit)}`) +
+        quick('amount', [100, 500, 1000, 5000].filter(v => v <= Math.min(avail || 0, limit)), avail) +
+        actions(`Review`, 'review');
+    },
+    async submit(f, current) {
+      const a = account(), amount = whole(f.values.amount);
+      if (f.step === 'edit') {
+        const avail = f.action === 'deposit' ? snap().cash : a.balance;
+        if (amount < 1 || amount > snap().limit) throw new Error(`Enter a whole amount from $1 to ${money(snap().limit)}.`);
+        if (amount > avail) throw new Error(f.action === 'deposit' ? 'You do not have that much cash.' : 'The balance is too low.');
+        if (f.action === 'transfer') {
+          const number = String(f.values.number || '').trim().toUpperCase();
+          if (!/^WB-\d{6}$/.test(number)) throw new Error('Enter an account number like WB-123456.');
+          const r = await call('resolveRecipient', { accountId: a.id, accountNumber: number, amount });
+          f.token = r.token;
+          f.reviewNote = `From ${a.name} to ${r.name} (${r.maskedNumber}).`;
+        } else f.reviewNote = f.action === 'deposit' ? `Cash into ${a.name}.` : `Cash out of ${a.name}.`;
+        f.step = 'review';
+        return;
+      }
+      await call(f.action, { accountId: a.id, amount, requestId: f.request, recipientToken: f.token });
+      await finish(current, `${DONE[f.action]} ${money(amount)}.`);
+    },
+  },
+  openAccount: {
+    title: () => 'Open an account',
+    body: f => field('name', 'account-name', 'Account name', 'Rainy day') +
+      choice('kind', [['savings', 'Savings'], ['shared', 'Shared']], f.values.kind || 'savings',
+        f.values.kind === 'shared' ? 'Yours, and you can share it with others from your phone.' : 'Just yours. Move money in and out with transfers.') +
+      actions('Open account', 'submit'),
+    async submit(f, current) {
+      const label = String(f.values.name || '').trim();
+      if (!label) throw new Error('Give the account a name.');
+      const r = await call('createAccount', { label, kind: f.values.kind || 'savings' });
+      await finish(current, `Opened ${label}.`, r.accountId);
+    },
+  },
+  issueCard: {
+    title: () => 'New debit card',
+    body: f => `<p class="sheet-note">The card goes into your inventory. Choose a four-digit PIN you will type at ATMs.</p>` +
+      pinPad(f.values.pin || '', f.values.confirming ? 'Type it again' : 'Choose a PIN') + actions(f.values.confirming ? 'Issue card' : 'Next', 'submit'),
+    async submit(f, current) {
+      const pin = f.values.pin || '';
+      if (!/^\d{4}$/.test(pin)) throw new Error('Enter four digits.');
+      if (!f.values.confirming) { f.values = { first: pin, pin: '', confirming: true }; return; }
+      if (pin !== f.values.first) { f.values = { pin: '' }; throw new Error('The PINs did not match. Choose it again.'); }
+      await call('issueCard', { accountId: account().id, pin, requestId: f.request });
+      await finish(current, 'Debit card issued to your inventory.');
+    },
+  },
+  cardLimit: {
+    title: () => 'Daily ATM limit',
+    body: f => field('limit', 'card-limit', 'Limit per day', '0 for no limit', `Up to ${money(snap().plus?.limits?.cardLimit || 0)}. Each ATM withdrawal also has the machine's own limit.`) +
+      actions('Save limit', 'submit'),
+    async submit(f, current) {
+      await plus('cardControl', { account: f.account, card: f.card, action: 'limit', value: whole(f.values.limit) });
+      await finish(current, 'Card limit saved.');
+    },
+  },
+  cardName: {
+    title: () => 'Name this card',
+    body: () => field('name', 'card-name', 'Card name', 'Everyday') + actions('Save name', 'submit'),
+    async submit(f, current) {
+      await plus('cardControl', { account: f.account, card: f.card, action: 'rename', value: String(f.values.name || '') });
+      await finish(current, 'Card renamed.');
+    },
+  },
+  vaultNew: {
+    title: () => 'New vault',
+    body: f => field('name', 'vault-name', 'Name', 'New car') +
+      field('goal', 'vault-goal', 'Goal', 'Optional', 'We tell you when the vault reaches it.') +
+      field('lock', 'vault-lock', 'Lock for', '0 days', `While locked nothing can leave the vault. Up to ${snap().plus?.limits?.lockDays || 0} days, and a lock can't be shortened.`) +
+      colours(f.values.colour || 'blue') + actions('Open vault', 'submit'),
+    async submit(f, current) {
+      const name = String(f.values.name || '').trim();
+      if (!name) throw new Error('Give the vault a name.');
+      await plus('vaultCreate', { name, goal: whole(f.values.goal), lockDays: whole(f.values.lock), colour: f.values.colour || 'blue' });
+      await finish(current, `${name} is open. Move money in to start saving.`);
+    },
+  },
+  vaultEdit: {
+    title: f => vaultOf(f.vault)?.name || 'Vault',
+    body: f => field('goal', 'vault-goal', 'Goal', 'No goal') +
+      field('lock', 'vault-lock', 'Lock for', 'Keep as is', 'Extends the lock from now. It can never be shortened.') +
+      colours(f.values.colour || vaultOf(f.vault)?.colour) + actions('Save changes', 'submit'),
+    async submit(f, current) {
+      const args = { id: f.vault, goal: whole(f.values.goal), colour: f.values.colour };
+      if (String(f.values.lock || '').trim()) args.lockDays = whole(f.values.lock);
+      await plus('vaultEdit', args);
+      await finish(current, 'Vault updated.');
+    },
+  },
+  vaultMove: {
+    title: f => (f.direction === 'in' ? 'Add to ' : 'Take from ') + (vaultOf(f.vault)?.name || 'vault'),
+    body: f => accountChoice('account', f.direction === 'in' ? 'From' : 'To', f.values.account) +
+      field('amount', 'vault-amount', 'Amount', '$0') +
+      quick('amount', [100, 500, 1000], f.direction === 'in' ? accountById(f.values.account)?.balance : vaultOf(f.vault)?.balance) +
+      actions(f.direction === 'in' ? 'Add money' : 'Take money out', 'submit'),
+    async submit(f, current) {
+      const amount = whole(f.values.amount);
+      if (!amount) throw new Error('Enter an amount.');
+      if (!f.values.account) throw new Error('Pick an account.');
+      await plus('vaultMove', { id: f.vault, account: +f.values.account, amount, direction: f.direction });
+      await finish(current, `${f.direction === 'in' ? 'Added' : 'Took out'} ${money(amount)}.`);
+    },
+  },
+  vaultClose: {
+    title: f => 'Close ' + (vaultOf(f.vault)?.name || 'vault'),
+    body: f => `<p class="sheet-note">${money(vaultOf(f.vault)?.balance)} moves to the account you pick, then the vault closes for good.</p>` +
+      accountChoice('account', 'Move the money to', f.values.account) + actions('Close vault', 'submit', 'danger'),
+    async submit(f, current) {
+      await plus('vaultClose', { id: f.vault, account: +f.values.account || 0 });
+      await finish(current, 'Vault closed.');
+    },
+  },
+  schedule: {
+    title: () => 'New standing order',
+    body: f => {
+      const to = f.values.toKind || 'mine';
+      const intervals = snap().plus?.intervals || [24];
+      return `<p class="sheet-note">From ${h(account()?.name)}. It pays by itself, even while you're away.</p>` +
+        choice('toKind', [['mine', 'My account'], ['other', 'Someone else']], to) +
+        (to === 'mine' ? accountChoice('to', 'Pay into', f.values.to, account()?.id, true) : field('number', 'so-number', 'Account number', 'WB-123456')) +
+        field('amount', 'so-amount', 'Amount each time', '$0') +
+        choice('every', intervals.map(v => [String(v), EVERY[v] || `Every ${v} hours`]), String(f.values.every || intervals[Math.min(2, intervals.length - 1)])) +
+        field('label', 'so-label', 'What for', 'Rent, allowance…') +
+        field('runs', 'so-runs', 'Stop after', 'Until I stop it', 'Number of payments.') +
+        actions('Set up standing order', 'submit');
+    },
+    async submit(f, current) {
+      const intervals = snap().plus?.intervals || [24];
+      const args = { from: +account().id, amount: whole(f.values.amount), label: String(f.values.label || ''),
+        everyHours: +(f.values.every || intervals[Math.min(2, intervals.length - 1)]) };
+      if (!args.amount) throw new Error('Enter an amount.');
+      if ((f.values.toKind || 'mine') === 'mine') { if (!f.values.to) throw new Error('Pick the account to pay into.'); args.to = +f.values.to; }
+      else args.number = String(f.values.number || '').trim();
+      if (String(f.values.runs || '').trim()) args.runs = whole(f.values.runs);
+      await plus('scheduleCreate', args);
+      await finish(current, 'Standing order set up.');
+    },
+  },
+  payRequest: {
+    title: f => `Pay ${money(f.amount)}`,
+    body: f => `<p class="sheet-note">${h(f.name)} asked${f.note ? ` for ${h(f.note)}` : ''}.</p>` +
+      accountChoice('account', 'Pay from', f.values.account) + actions(`Pay ${money(f.amount)}`, 'submit'),
+    async submit(f, current) {
+      await plus('requestPay', { id: f.id, account: +f.values.account || 0 });
+      await finish(current, `Paid ${money(f.amount)} to ${f.name}.`);
+    },
+  },
+  confirm: {
+    title: f => f.heading,
+    body: f => `<p class="sheet-note">${h(f.text)}</p>` + actions(f.yes, 'submit', f.danger ? 'danger' : ''),
+    async submit(f, current) { await f.run(); await finish(current, f.done); },
+  },
+};
+
+const vaultOf = id => (snap().plus?.vaults || []).find(v => String(v.id) === String(id));
+
+async function finish(current, message, accountId) {
+  current.form = null;
+  current.notice = { text: message, kind: 'success' };
+  try { await reload(current, accountId); } catch { current.notice = { text: message + ' Refresh to see the new balance.', kind: 'success' }; }
+}
+
+async function submitForm() {
+  const f = state?.form;
+  if (!f) return;
+  await run(async current => {
+    f.error = null;
+    try { await FORMS[f.kind].submit(f, current); }
+    catch (e) { if (state === current && current.form === f) f.error = e.message; else throw e; }
+  });
+  if (state?.form === f) focusFirst('.sheet [data-primary]') || focusFirst('.sheet');
+}
+
+// form pieces
+function field(key, editor, label, placeholder, help) {
+  const v = state.form.values[key];
+  const shown = v === undefined || v === '' ? `<span class="ph">${h(placeholder)}</span>` :
+    (editor.includes('amount') || editor === 'vault-goal' || editor === 'card-limit' ? h(money(whole(v))) : h(v));
+  return `<label class="fld"><span class="fld-l">${h(label)}</span>` +
+    `<button type="button" class="fld-v" data-k="f-${key}" data-edit="${editor}" data-key="${key}">${shown}</button>` +
+    (help ? `<small>${h(help)}</small>` : '') + `</label>`;
+}
+function quick(key, values, all) {
+  const chips = values.map(v => `<button type="button" class="chip" data-k="q-${v}" data-set="${key}" data-v="${v}">${money(v)}</button>`);
+  if (all > 0) chips.push(`<button type="button" class="chip" data-k="q-all" data-set="${key}" data-v="${Math.floor(all)}">All ${money(all)}</button>`);
+  return chips.length ? `<div class="chips">${chips.join('')}</div>` : '';
+}
+function choice(key, options, value, help) {
+  return `<div class="seg" role="group">${options.map(([v, label]) =>
+    `<button type="button" data-k="c-${key}-${v}" data-set="${key}" data-v="${h(v)}" aria-pressed="${String(v) === String(value)}">${h(label)}</button>`).join('')}</div>` +
+    (help ? `<small class="seg-help">${h(help)}</small>` : '');
+}
+function accountChoice(key, label, value, exclude, includeVaults) {
+  const f = state.form;
+  const list = (includeVaults ? snap().accounts : everyday()).filter(a => a.id !== String(exclude) && a.id !== String(f.vault) && !a.frozen);
+  if (!value && list[0]) { f.values[key] = list[0].id; value = list[0].id; }
+  return `<div class="fld"><span class="fld-l">${h(label)}</span><div class="pick">${list.map(a =>
+    `<button type="button" data-k="a-${key}-${a.id}" data-set="${key}" data-v="${a.id}" aria-pressed="${a.id === String(value)}">` +
+    `<span>${h(a.name)}</span><b>${money(a.balance)}</b></button>`).join('') || '<p class="muted">No account to use.</p>'}</div></div>`;
+}
+function colours(value) {
+  return `<div class="fld"><span class="fld-l">Colour</span><div class="swatches">${VAULT_COLOURS.map(c =>
+    `<button type="button" class="sw v-${c}" data-k="sw-${c}" data-set="colour" data-v="${c}" aria-pressed="${c === value}" aria-label="${c}"></button>`).join('')}</div></div>`;
+}
+function actions(label, act, tone = '') {
+  return `<div class="sheet-actions"><button type="button" data-k="cancel" data-act="closeForm">Cancel</button>` +
+    `<button type="button" class="primary ${tone}" data-primary data-k="go" data-act="${act === 'review' ? 'submit' : 'submit'}">${h(label)}</button></div>`;
+}
+function review(total, note, label) {
+  return `<div class="review"><span>You're about to move</span><strong>${h(total)}</strong><p>${h(note)}</p></div>` +
+    `<div class="sheet-actions"><button type="button" data-k="back" data-act="formBack">Change</button>` +
+    `<button type="button" class="primary" data-primary data-k="go" data-act="submit">${h(label)}</button></div>`;
+}
+function pinPad(value, label) {
+  const dots = [0, 1, 2, 3].map(i => `<i class="${i < value.length ? 'on' : ''}"></i>`).join('');
+  const keys = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'clear', '0', 'del'].map(k =>
+    `<button type="button" data-k="pin-${k}" data-pin="${k}" class="${k.length > 1 ? 'fn' : ''}">${k === 'del' ? '⌫' : k === 'clear' ? 'Clear' : k}</button>`).join('');
+  return `<div class="pin"><span class="pin-l">${h(label)}</span><div class="pin-dots" aria-label="${value.length} of 4 digits">${dots}</div><div class="pin-keys">${keys}</div></div>`;
+}
+
+// ---------------------------------------------------------------- branch views
+// THE LOOK: security printing. Real banks print cheques, notes and cards with guilloche (interlaced engraved
+// rosettes), microprint and serial numbers so they can't be copied; here that linework, drawn in the bank's own
+// colour (Config.BankColour), is the bank's signature. Everything around it stays quiet: WHIP's surfaces and type.
+
+const guillocheCache = new Map();
+/** Interlaced rosettes and wave bands, as one SVG path set (cached by size and seed). */
+function guilloche(w, h, seed = 1) {
+  const key = `${w}x${h}:${seed}`;
+  if (guillocheCache.has(key)) return guillocheCache.get(key);
+  const paths = [];
+  const rosette = (cx, cy, R, r, d, turns, steps) => {
+    let p = '';
+    for (let i = 0; i <= steps; i++) {
+      const t = (i / steps) * Math.PI * 2 * turns;
+      const x = cx + (R - r) * Math.cos(t) + d * Math.cos(((R - r) / r) * t);
+      const y = cy + (R - r) * Math.sin(t) - d * Math.sin(((R - r) / r) * t);
+      p += (i ? 'L' : 'M') + x.toFixed(1) + ' ' + y.toFixed(1);
+    }
+    return p;
+  };
+  const big = Math.min(w, h);
+  paths.push(`<path class="g1" d="${rosette(w * 0.82, h * 0.5, big * 0.62, big * (0.11 + seed * 0.004), big * 0.2, 11, 1400)}"/>`);
+  paths.push(`<path class="g2" d="${rosette(w * 0.82, h * 0.5, big * 0.44, big * 0.07, big * 0.15, 7, 900)}"/>`);
+  for (let k = 0; k < 9; k++) {
+    let p = '';
+    for (let x = 0; x <= w; x += 6) {
+      const y = h * (0.12 + k * 0.1) + Math.sin(x / (18 + k * 2) + k + seed) * (5 + k) + Math.sin(x / 61) * 6;
+      p += (x ? 'L' : 'M') + x + ' ' + y.toFixed(1);
+    }
+    paths.push(`<path class="g3" d="${p}"/>`);
   }
-  current.focus = 'bank';
+  const svg = `<svg class="guilloche" viewBox="0 0 ${w} ${h}" preserveAspectRatio="xMidYMid slice" aria-hidden="true">${paths.join('')}</svg>`;
+  guillocheCache.set(key, svg);
+  return svg;
 }
 
-function hide() {
-  closeDropdown(false);
-  closePinPad(false);
-  setController(false);
-  session = null;
-  bank.hidden = true;
-  el('account').replaceChildren();
-  el('entries').replaceChildren();
-  for (const id of ['customer', 'balance', 'number', 'cash', 'review-total', 'review-note']) el(id).textContent = '';
-  el('move').reset();
-  el('card-pin').value = '';
-  el('card-list').replaceChildren();
-  el('card-select').replaceChildren();
+/** A line of microprint, as on a note's border: the bank's name, repeated. */
+const microprint = () => `<div class="micro" aria-hidden="true">${h(((snap().bank?.name || 'Bank') + ' ').toUpperCase().repeat(24))}</div>`;
+
+/** WB-178928 → WB 178 928, as a card or cheque prints it */
+const serial = n => String(n || '').replace(/^WB-(\d{3})(\d{3})$/, 'WB $1 $2');
+
+// What a statement line was, from its text: the icon and colour of the circle beside it.
+const CATS = [
+  ['income', 'In', 'M12 5v14m0 0-6-6m6 6 6-6'],
+  ['cash', 'Cash', 'M3 7h18v10H3zM12 10a2 2 0 1 0 0 4 2 2 0 0 0 0-4Z', ['cash', 'atm', 'withdraw']],
+  ['food', 'Food & drink', 'M7 3v8m-2-8v4a2 2 0 0 0 4 0V3M7 11v10m10-18c-2 0-3 2-3 5s1 4 3 4v9', ['food', 'cafe', 'coffee', 'burger', 'pizza', 'restaurant', 'bar', 'drink', 'diner', 'taco']],
+  ['vehicles', 'Vehicles', 'M5 16h14M6 16l1.5-5h9L18 16M7 19a1 1 0 1 0 0-2M17 19a1 1 0 1 0 0-2', ['fuel', 'gas', 'garage', 'vehicle', 'car', 'repair', 'tuning', 'impound', 'park', 'dealership']],
+  ['housing', 'Housing', 'M4 11 12 4l8 7v9H4z', ['rent', 'property', 'house', 'home', 'apartment', 'mortgage']],
+  ['bills', 'Bills', 'M7 3h10v18l-2.5-1.5L12 21l-2.5-1.5L7 21zM10 8h4m-4 4h4', ['fine', 'bill', 'tax', 'fee', 'invoice', 'ticket', 'phone']],
+  ['shopping', 'Shopping', 'M5 8h14l-1 12H6zM9 8a3 3 0 0 1 6 0', ['shop', 'store', 'purchase', 'market', 'clothing', 'gun', 'ammu', 'sale']],
+  ['savings', 'Savings', 'M5 4h14v16H5zM12 9a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z', ['vault', 'savings', 'interest']],
+  ['people', 'People', 'M9 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm-6 9a6 6 0 0 1 12 0m2-9a3 3 0 1 0 0-6m4 15a6 6 0 0 0-4-5.6', ['request', 'split', 'transfer', 'standing order', 'from', 'to ']],
+];
+function catOf(t) {
+  const text = String(t.description || '').toLowerCase();
+  if (t.amount > 0 && !/vault|interest/.test(text)) return CATS[0];
+  return CATS.slice(1).find(c => c[3].some(w => text.includes(w))) || ['other', 'Other', 'M12 8v4m0 4h.01M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z'];
 }
 
-async function close() {
-  const current = session;
-  if (!current || current.busy || current.closing) return;
-  current.closing = true;
-  updateControls();
+/** The statement, grouped by day like a printed statement: Today, Yesterday, then dates. */
+function ledgerRows(items, running) {
+  if (!items.length) return `<p class="empty">Nothing has moved on this account yet.</p>`;
+  const groups = [];
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  for (const t of items) {
+    const d = when(t.date);
+    let label = '';
+    if (d) {
+      const day = new Date(d); day.setHours(0, 0, 0, 0);
+      const diff = Math.round((today - day) / 86400000);
+      label = diff === 0 ? 'Today' : diff === 1 ? 'Yesterday' : fmtDay.format(d);
+    }
+    if (!groups.length || groups[groups.length - 1].label !== label) groups.push({ label, items: [] });
+    groups[groups.length - 1].items.push(t);
+  }
+  return `<div class="feed${running ? ' running' : ''}">${groups.map(g => `<section><h3>${h(g.label)}</h3><ol>${g.items.map(t => {
+    const c = catOf(t), d = when(t.date);
+    return `<li><span class="cat c-${c[0]}">${icon(c[2])}</span>` +
+      `<span class="what"><b>${h(t.description)}</b><small>${h(c[1])}${d ? ' · ' + fmtTime.format(d) : ''}</small></span>` +
+      `<span class="amt ${t.amount > 0 ? 'in' : ''}">${signed(t.amount)}</span>` +
+      (running ? `<span class="run">${t.balance != null ? money(t.balance) : ''}</span>` : '') + `</li>`;
+  }).join('')}</ol></section>`).join('')}</div>`;
+}
+
+function trendPath(points, w = 600, ht = 60) {
+  if (points.length < 2) return '';
+  const hi = Math.max(...points), lo = Math.min(...points);
+  return points.map((v, i) => `${(i / (points.length - 1) * w).toFixed(1)} ${(hi === lo ? ht / 2 : ht - 4 - (v - lo) / (hi - lo) * (ht - 8)).toFixed(1)}`).join(' L');
+}
+
+/** The account as the card in your wallet: bank colour, security print, chip, serial, holder. */
+function accountCard(a, small = false) {
+  return `<div class="acard t-${typeName(a).toLowerCase()}${small ? ' sm' : ''}${a.frozen ? ' frozen' : ''}">${guilloche(small ? 220 : 430, small ? 138 : 270, (+a.id % 7) + 1)}
+    <span class="ac-top"><b>${h(snap().bank?.name || 'Bank')}</b><i>${h(typeName(a))}</i></span>
+    ${small ? '' : '<span class="ac-chip"></span>'}
+    <span class="ac-num">${h(serial(a.number))}</span>
+    <span class="ac-foot"><span>${h(a.name)}</span>${small ? '' : `<span>${h(snap().characterName || '')}</span>`}</span>
+    ${a.frozen ? '<em class="ac-flag">Frozen</em>' : ''}</div>`;
+}
+
+function bigBalance(n) {
+  const text = money(n);
+  const size = Math.max(34, Math.min(66, 66 - Math.max(0, text.length - 9) * 4.2));
+  return `<strong class="balance" style="font-size:${size.toFixed(0)}px">${text}</strong>`;
+}
+
+function hero() {
+  const a = account(), s = snap();
+  if (!a) return `<section class="hero"><p class="empty">You have no account to use here.</p></section>`;
+  const i = state.insights && state.insights.accountId === +a.id ? state.insights : null;
+  const points = s.recent.slice().reverse().map(t => t.balance).filter(Number.isFinite);
+  const line = trendPath(points, 300, 54);
+  const can = x => !state.busy && !a.frozen && (x === 'deposit' ? a.canDeposit !== false : a.canWithdraw !== false);
+  const act = (x, label, d, extra = '') => `<button type="button" class="round" data-k="mv-${x}" ${extra || `data-act="move" data-v="${x}" ${can(x) ? '' : 'disabled'}`}><i>${icon(d)}</i><span>${label}</span></button>`;
+  const others = s.accounts.filter(x => x.id !== a.id);
+  return `<section class="hero">
+    <div class="hero-card">${accountCard(a)}
+      ${others.length ? `<div class="wallet-stack" role="tablist" aria-label="Your accounts">${s.accounts.map(x =>
+        `<button type="button" role="tab" data-k="tab-${x.id}" data-act="selectAccount" data-id="${x.id}" aria-selected="${x.id === a.id}"><i class="dot"></i>${h(x.name)}</button>`).join('')}</div>` : ''}
+    </div>
+    <div class="hero-main">
+      <span class="hero-l">Available balance</span>
+      ${bigBalance(a.balance)}
+      <div class="hero-stats">
+        <span><small>In, 30 days</small><b class="in">${i ? money(i.monthIn) : '—'}</b></span>
+        <span><small>Out, 30 days</small><b>${i ? money(i.monthOut) : '—'}</b></span>
+        <span class="spark">${line ? `<svg viewBox="0 0 300 54" preserveAspectRatio="none" aria-hidden="true"><path class="sp-a" d="M${line} V54 H0Z"/><path class="sp-l" d="M${line}"/></svg>` : ''}<small>Recent balance</small></span>
+      </div>
+      <div class="rounds">
+        ${act('deposit', 'Deposit', 'M12 19V5m0 0-6 6m6-6 6 6')}
+        ${act('withdraw', 'Withdraw', 'M12 5v14m0 0-6-6m6 6 6-6')}
+        ${act('transfer', 'Transfer', 'M4 8h16m-4-4 4 4-4 4m4 4H4m4-4-4 4 4 4')}
+        ${act('statement', 'Statement', 'M7 3h7l5 5v13H7zM14 3v5h5M10 13h6M10 17h6', 'data-act="view" data-v="statement"')}
+      </div>
+    </div>
+    ${microprint()}
+  </section>`;
+}
+
+/** A donut of where the money went: the month's spending by category, the total in the middle. */
+function donut(i, size = 150) {
+  const cats = (i?.categories || []).slice(0, 6);
+  const r = size / 2 - 12, C = 2 * Math.PI * r;
+  let off = 0;
+  const arcs = cats.map((c, n) => {
+    const len = Math.max(0, c.share * C - 3);
+    const seg = `<circle class="d-${n}" cx="${size / 2}" cy="${size / 2}" r="${r}" stroke-dasharray="${len.toFixed(1)} ${(C - len).toFixed(1)}" stroke-dashoffset="${(-off).toFixed(1)}"/>`;
+    off += c.share * C;
+    return seg;
+  }).join('');
+  return `<div class="donut"><svg viewBox="0 0 ${size} ${size}" style="width:${size}px;height:${size}px" aria-hidden="true">` +
+    `<circle class="d-track" cx="${size / 2}" cy="${size / 2}" r="${r}"/>${arcs}</svg>` +
+    `<span><small>Spent</small><b>${money(i?.monthOut || 0)}</b></span></div>` +
+    `<ol class="d-legend">${cats.map((c, n) => `<li><i class="d-${n}"></i><span>${h(c.label)}</span><b>${money(c.total)}</b></li>`).join('')}</ol>`;
+}
+
+/** A savings jar, filled to its goal. */
+function jar(v, w = 74) {
+  const p = Math.max(0.04, Math.min(1, v.goal ? v.progress || 0 : 0.35));
+  const top = 22 + (1 - p) * 64;
+  return `<svg class="jar v-${v.colour}" viewBox="0 0 80 100" style="width:${w}px;height:${Math.round(w * 1.25)}px" aria-hidden="true">
+    <defs><clipPath id="jar-${v.id}"><path d="M18 18h44v6c8 4 10 10 10 18v42c0 6-4 10-10 10H18c-6 0-10-4-10-10V42c0-8 2-14 10-18z"/></clipPath></defs>
+    <g clip-path="url(#jar-${v.id})"><rect class="jar-fill" x="0" y="${top.toFixed(1)}" width="80" height="100"/>
+    <path class="jar-wave" d="M0 ${top.toFixed(1)} q10 -4 20 0 t20 0 t20 0 t20 0 V100 H0z"/></g>
+    <path class="jar-glass" d="M18 18h44v6c8 4 10 10 10 18v42c0 6-4 10-10 10H18c-6 0-10-4-10-10V42c0-8 2-14 10-18z"/>
+    <rect class="jar-lid" x="15" y="8" width="50" height="11" rx="3"/></svg>`;
+}
+
+function viewOverview() {
+  const s = snap(), p = s.plus || {}, inc = p.requests?.incoming || [];
+  const a = account(), i = state.insights && a && state.insights.accountId === +a.id ? state.insights : null;
+  const next = (p.schedules || []).filter(x => x.status === 'active').sort((x, y) => x.nextRunAt - y.nextRunAt)[0];
+  const vaults = p.vaults || [];
+  return hero() + `<div class="cols">
+    <section class="panel"><header class="ph-row"><h2>Activity</h2><button type="button" class="link" data-k="ov-st" data-act="view" data-v="statement">Full statement</button></header>
+      ${ledgerRows(s.recent.slice(0, 7))}</section>
+    <div class="stack">
+      ${inc.length ? `<section class="panel attn"><h2>${inc.length === 1 ? 'Someone asked you for money' : `${inc.length} people asked you for money`}</h2>${inc.slice(0, 3).map(requestRow).join('')}</section>` : ''}
+      <section class="panel"><header class="ph-row"><h2>This month</h2><button type="button" class="link" data-k="ov-i" data-act="view" data-v="insights">Insights</button></header>
+        ${i ? (i.categories.length ? donut(i, 128) : '<p class="muted">No spending in the last 30 days.</p>') : '<p class="muted">Reading your statement…</p>'}</section>
+      <section class="panel"><header class="ph-row"><h2>Vaults</h2><button type="button" class="link" data-k="ov-v" data-act="view" data-v="vaults">${vaults.length ? 'All vaults' : 'Start saving'}</button></header>
+        ${vaults.length ? `<div class="jars">${vaults.slice(0, 3).map(v => `<div class="jar-mini">${jar(v, 46)}<span><b>${money(v.balance)}</b><small>${h(v.name)}</small></span></div>`).join('')}</div>`
+          : '<p class="muted">Put money aside in a jar with a goal and a time lock, and earn interest on it.</p>'}</section>
+      ${next ? `<section class="panel"><header class="ph-row"><h2>Next standing order</h2><button type="button" class="link" data-k="ov-p" data-act="view" data-v="payments">Payments</button></header>
+        <p class="next-so"><b>${money(next.amount)}</b> to ${h(next.toLabel)}<br><span class="muted">${h(next.label || EVERY[next.everyHours] || '')}, next ${h(relDay(next.nextRunAt))}</span></p></section>` : ''}
+    </div></div>`;
+}
+
+function viewAccounts() {
+  const s = snap();
+  return `<header class="v-head"><h1>Accounts</h1><button type="button" class="primary" data-k="acc-new" data-act="openAccount">Open an account</button></header>
+    <div class="acct-grid">${s.accounts.map(a => `<button type="button" class="acct-tile ${a.id === s.selectedAccountId ? 'sel' : ''}" data-k="acc-${a.id}" data-act="selectAccount" data-id="${a.id}">
+      ${accountCard(a, true)}<span class="at-meta"><b>${money(a.balance)}</b><small>${h(typeName(a))}${a.role && a.role !== 'owner' ? ` · ${h(a.role)} access` : ''}</small></span></button>`).join('')}</div>
+    <p class="muted foot">Share an account with someone, or close one, from the Bank app on your phone.</p>`;
+}
+
+function cardArt(c, a) {
+  return `<div class="dcard ${c.status === 'blocked' ? 'frozen' : ''}">${guilloche(340, 214, 3)}<span class="dc-bank">${h(snap().bank?.name || 'Bank')}</span>
+    <span class="dc-chip"></span><span class="dc-num">•••• •••• •••• ${h(c.lastFour)}</span>
+    <span class="dc-name">${h(c.nickname || a?.name || 'Debit')}</span><span class="dc-kind">Debit</span>${c.status === 'blocked' ? '<span class="dc-flag">Frozen</span>' : ''}</div>`;
+}
+
+function viewCards() {
+  const a = account();
+  if (!a) return `<header class="v-head"><h1>Cards</h1></header><p class="empty">Pick an account first.</p>`;
+  const cards = cardsFor(a.id);
+  const canIssue = a.canWithdraw !== false && !a.frozen && cards.length < 3;
+  return `<header class="v-head"><h1>Cards for ${h(a.name)}</h1>${canIssue ? '<button type="button" class="primary" data-k="card-new" data-act="issueCard">New debit card</button>' : ''}</header>
+    ${snap().cardError ? `<p class="notice error">${h(snap().cardError)}</p>` : ''}
+    ${cards.length ? `<div class="card-grid">${cards.map(c => {
+      const pct = c.dailyLimit ? Math.min(100, Math.round(c.spentToday / c.dailyLimit * 100)) : 0;
+      const k = c.cardId.slice(-6);
+      return `<section class="panel card-panel">${cardArt(c, a)}
+        <dl><div><dt>Taken from ATMs today</dt><dd>${money(c.spentToday)}${c.dailyLimit ? ` of ${money(c.dailyLimit)}` : ''}</dd></div>
+        <div><dt>In your inventory</dt><dd>${c.carried ? 'Yes' : 'No'}</dd></div></dl>
+        ${c.dailyLimit ? `<div class="bar"><i style="width:${pct}%"></i></div>` : ''}
+        <div class="btns">
+          <button type="button" data-k="cf-${k}" data-act="card" data-v="${c.status === 'blocked' ? 'unfreeze' : 'freeze'}" data-card="${c.cardId}">${c.status === 'blocked' ? 'Unfreeze' : 'Freeze'}</button>
+          <button type="button" data-k="cl-${k}" data-act="card" data-v="limit" data-card="${c.cardId}">Daily limit</button>
+          <button type="button" data-k="cn-${k}" data-act="card" data-v="rename" data-card="${c.cardId}">Rename</button>
+          <button type="button" class="danger" data-k="cr-${k}" data-act="card" data-v="revoke" data-card="${c.cardId}">Cancel card</button>
+        </div></section>`; }).join('')}</div>`
+      : `<p class="empty">${canIssue ? 'No cards on this account yet. A debit card works at every ATM in the city.' : 'Cards can be issued for accounts you can withdraw from.'}</p>`}`;
+}
+
+function viewVaults() {
+  const p = snap().plus || {}, vaults = p.vaults || [], max = p.limits?.vaults || 0;
+  return `<header class="v-head"><h1>Vaults</h1>${vaults.length < max ? '<button type="button" class="primary" data-k="v-new" data-act="vaultNew">New vault</button>' : ''}</header>
+    ${vaults.length ? `<div class="vault-grid">${vaults.map(v => {
+      const locked = v.lockedUntil > Date.now() / 1000;
+      return `<section class="panel vault v-${v.colour}">
+        <div class="vault-top">${jar(v, 84)}
+          <div><h2>${h(v.name)}</h2><strong>${money(v.balance)}</strong>
+          <small>${v.goal ? `${Math.floor((v.progress || 0) * 100)}% of ${money(v.goal)}` : 'No goal set'}</small></div></div>
+        <ul class="facts">
+          <li>${locked ? `${icon('M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z')}Locked until ${h(fmtFull.format(when(v.lockedUntil)))}` : `${icon('M7 11V8a5 5 0 0 1 9.6-2M5 11h14v10H5z')}Unlocked`}</li>
+          <li>${icon('M4 18 10 12l4 4 6-8')}${v.rate}% interest, ${money(v.interestEarned)} earned so far</li>
+        </ul>
+        <div class="btns">
+          <button type="button" class="primary" data-k="vi-${v.id}" data-act="vault" data-v="in" data-id="${v.id}">Add money</button>
+          <button type="button" data-k="vo-${v.id}" data-act="vault" data-v="out" data-id="${v.id}" ${locked ? 'disabled' : ''}>Take out</button>
+          <button type="button" data-k="ve-${v.id}" data-act="vault" data-v="edit" data-id="${v.id}">Edit</button>
+          <button type="button" class="danger" data-k="vc-${v.id}" data-act="vault" data-v="close" data-id="${v.id}" ${locked ? 'disabled' : ''}>Close</button>
+        </div></section>`; }).join('')}</div>`
+      : `<p class="empty">A vault is a jar for one goal. Lock it so you can't dip in, and it earns interest while you're in the city.</p>`}`;
+}
+
+function requestRow(r) {
+  return `<div class="req"><span class="cat c-people">${icon(CATS[8][2])}</span><span class="r-main"><b>${h(r.name)}</b><small>${h(r.note || 'Payment request')} · ${h(relDay(r.createdAt))}</small></span>
+    <b class="r-val">${money(r.amount)}</b><span class="btns">
+    <button type="button" class="primary" data-k="rp-${r.id}" data-act="request" data-v="pay" data-id="${r.id}">Pay</button>
+    <button type="button" data-k="rd-${r.id}" data-act="request" data-v="decline" data-id="${r.id}">Decline</button></span></div>`;
+}
+
+function viewPayments() {
+  const p = snap().plus || {}, so = p.schedules || [], inc = p.requests?.incoming || [], out = p.requests?.outgoing || [];
+  const a = account();
+  const STATUS = { pending: 'Waiting', paid: 'Paid', declined: 'Declined', cancelled: 'Withdrawn', expired: 'Expired', paying: 'Paying' };
+  return `<header class="v-head"><h1>Payments</h1><div class="btns">
+      <button type="button" data-k="p-tf" data-act="move" data-v="transfer" ${a && !a.frozen && a.canWithdraw !== false ? '' : 'disabled'}>Transfer</button>
+      <button type="button" class="primary" data-k="p-so" data-act="schedule" ${a && a.canWithdraw !== false ? '' : 'disabled'}>New standing order</button></div></header>
+    <section class="panel"><h2>Standing orders</h2>${so.length ? `<ol class="rows">${so.map(x => `<li class="row-static">
+      <span class="cat c-bills">${icon('M4 6h16v14H4zM4 10h16M8 3v4m8-4v4')}</span>
+      <span class="r-main"><b>${money(x.amount)} to ${h(x.toLabel)}</b><small>${h(x.label ? x.label + ', ' : '')}${h((EVERY[x.everyHours] || `Every ${x.everyHours} hours`).toLowerCase())}, from ${h(accountById(x.fromAccountId)?.name || 'an account')}${x.runsLeft ? `, ${x.runsLeft} left` : ''}</small>
+        ${x.status === 'paused' ? `<small class="warn">Paused${x.lastError ? ': ' + h(x.lastError) : ''}</small>` : `<small>Next ${h(relDay(x.nextRunAt))}</small>`}</span>
+      <span class="btns">${x.status === 'active'
+        ? `<button type="button" data-k="sn-${x.id}" data-act="so" data-v="run" data-id="${x.id}">Pay now</button><button type="button" data-k="sp-${x.id}" data-act="so" data-v="pause" data-id="${x.id}">Pause</button>`
+        : `<button type="button" data-k="sr-${x.id}" data-act="so" data-v="resume" data-id="${x.id}">Resume</button>`}
+        <button type="button" class="danger" data-k="sc-${x.id}" data-act="so" data-v="cancel" data-id="${x.id}">Cancel</button></span></li>`).join('')}</ol>`
+      : '<p class="muted">Pay rent, an allowance or your own vault automatically.</p>'}</section>
+    <div class="cols even">
+      <section class="panel"><h2>Asked of you</h2>${inc.length ? inc.map(requestRow).join('') : '<p class="muted">No one is waiting on you.</p>'}</section>
+      <section class="panel"><h2>You asked</h2>${out.length ? out.map(r => `<div class="req"><span class="cat c-people">${icon(CATS[8][2])}</span><span class="r-main"><b>${h(r.name)}</b><small>${h(r.note || 'Payment request')}${r.group ? ', split' : ''}</small></span>
+        <b class="r-val">${money(r.amount)}</b><span class="tag t-${r.status}">${STATUS[r.status] || h(r.status)}</span>
+        ${r.status === 'pending' ? `<span class="btns"><button type="button" data-k="rc-${r.id}" data-act="request" data-v="cancel" data-id="${r.id}">Withdraw</button></span>` : ''}</div>`).join('')
+        : '<p class="muted">Ask someone for money, or split a bill, from the Bank app on your phone.</p>'}</section>
+    </div>`;
+}
+
+function viewInsights() {
+  const a = account(), i = state.insights;
+  if (!a) return `<header class="v-head"><h1>Insights</h1></header><p class="empty">Pick an account first.</p>`;
+  if (!i || i.accountId !== +a.id) return `<header class="v-head"><h1>Insights for ${h(a.name)}</h1></header><p class="empty">${state.insightsError ? h(state.insightsError) : 'Reading your statement…'}</p>`;
+  const change = i.previousOut ? Math.round((i.monthOut - i.previousOut) / i.previousOut * 100) : null;
+  const top = Math.max(1, ...i.days.map(d => Math.max(d.in, d.out)));
+  const bw = 600 / i.days.length;
+  const bars = i.days.map((d, n) => {
+    const x = n * bw, hi = d.in / top * 120, ho = d.out / top * 120;
+    return `<rect class="b-in" rx="2" x="${(x + bw * .14).toFixed(1)}" y="${(130 - hi).toFixed(1)}" width="${(bw * .34).toFixed(1)}" height="${hi.toFixed(1)}"><title>${fmtDay.format(when(d.day))}: in ${money(d.in)}</title></rect>` +
+      `<rect class="b-out" rx="2" x="${(x + bw * .52).toFixed(1)}" y="${(130 - ho).toFixed(1)}" width="${(bw * .34).toFixed(1)}" height="${ho.toFixed(1)}"><title>${fmtDay.format(when(d.day))}: out ${money(d.out)}</title></rect>`;
+  }).join('');
+  return `<header class="v-head"><h1>Insights for ${h(a.name)}</h1><span class="muted">Last 30 days</span></header>
+    <div class="kpis">
+      <div class="panel"><span>Money in</span><strong class="in">${money(i.monthIn)}</strong></div>
+      <div class="panel"><span>Money out</span><strong>${money(i.monthOut)}</strong>${change !== null ? `<small>${change > 0 ? `${change}% more` : change < 0 ? `${-change}% less` : 'The same'} than the 30 days before</small>` : ''}</div>
+      <div class="panel"><span>Left over</span><strong class="${i.net >= 0 ? 'in' : 'out'}">${signed(i.net)}</strong><small>About ${money(i.averageDaily)} spent a day</small></div>
+    </div>
+    <div class="cols">
+      <section class="panel"><header class="ph-row"><h2>Last 14 days</h2><span class="legend"><i class="l-in"></i>In <i class="l-out"></i>Out</span></header>
+        <svg class="bars" viewBox="0 0 600 140" preserveAspectRatio="none" role="img" aria-label="Money in and out per day">${bars}<path class="axis" d="M0 130.5H600"/></svg>
+        <div class="bar-x"><span>${fmtDay.format(when(i.days[0].day))}</span><span>Today</span></div>
+        ${i.biggest ? `<p class="muted biggest">Biggest payment: ${money(i.biggest.amount)} for ${h(i.biggest.text)}, ${h(relDay(i.biggest.at))}.</p>` : ''}</section>
+      <section class="panel"><h2>Where it went</h2>${i.categories.length ? donut(i, 170) : '<p class="muted">No spending in the last 30 days.</p>'}</section>
+    </div>`;
+}
+
+function viewStatement() {
+  const a = account(), st = state.statement;
+  if (!a) return `<header class="v-head"><h1>Statements</h1></header><p class="empty">Pick an account first.</p>`;
+  return `<header class="v-head"><h1>Statement</h1><span class="muted">${h(a.name)} · ${h(serial(a.number))}</span></header>
+    <section class="panel paper">${microprint()}${st ? ledgerRows(st.items, true) : '<p class="empty">Loading the statement…</p>'}
+    ${st ? `<nav class="pager"><button type="button" data-k="pg-prev" data-act="page" data-v="-1" ${st.page <= 1 ? 'disabled' : ''}>Newer</button>
+      <span>Page ${st.page}</span><button type="button" data-k="pg-next" data-act="page" data-v="1" ${st.hasMore ? '' : 'disabled'}>Older</button></nav>` : ''}</section>`;
+}
+
+const VIEW_RENDER = { overview: viewOverview, accounts: viewAccounts, cards: viewCards, vaults: viewVaults,
+  payments: viewPayments, insights: viewInsights, statement: viewStatement };
+
+/** The bank's colour, only as a #rrggbb (it is put into a style attribute). */
+const brand = () => (/^#[0-9a-fA-F]{6}$/.test(snap().bank?.colour || '') ? snap().bank.colour : '#1f9e74');
+
+function seal(name) {
+  const letter = h((name || 'B').trim()[0] || 'B');
+  return `<span class="seal" aria-hidden="true">${guilloche(80, 80, 5)}<b>${letter}</b></span>`;
+}
+
+function renderBranch() {
+  const s = snap(), b = s.bank || {};
+  const waiting = (s.plus?.requests?.incoming || []).length;
+  const today = new Intl.DateTimeFormat('en-US', { weekday: 'long', month: 'long', day: 'numeric' }).format(new Date());
+  return `<div class="branch" style="--brand:${brand()}">
+    <header class="topbar">
+      <div class="brand">${seal(b.name)}<span><b>${h(b.name || 'Bank')}</b><small>${h(b.tagline || '')}</small></span></div>
+      <div class="session"><span class="where">${h(b.branch ? b.branch + ' branch' : 'Branch')}, ${h(today)}</span>
+        <span class="secure">${icon('M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z')}Signed in as ${h(s.characterName || '')}</span>
+        <button type="button" data-k="close" data-act="close">Sign out <kbd>Esc</kbd></button></div>
+    </header>
+    <div class="frame">
+      <nav class="rail" aria-label="Banking">
+        ${VIEWS.map(([id, label, d]) => `<button type="button" data-k="nav-${id}" data-act="view" data-v="${id}" aria-current="${state.view === id ? 'page' : 'false'}">${icon(d)}<span>${label}</span>${id === 'payments' && waiting ? `<em>${waiting}</em>` : ''}</button>`).join('')}
+        <div class="wallet"><span>Cash in your wallet</span><b>${money(s.cash)}</b></div>
+      </nav>
+      <section class="stage" aria-live="polite">
+        ${state.notice ? `<p class="notice ${state.notice.kind}" role="status">${h(state.notice.text)}</p>` : ''}
+        ${VIEW_RENDER[state.view]()}
+      </section>
+    </div>
+    ${pad ? `<footer class="hints"><span><img src="https://cfx-nui-whip_core/html/img/pad/dpad.svg" alt="">Move</span><span><img src="https://cfx-nui-whip_core/html/img/pad/a.svg" alt="">Select</span>
+      <span><img src="https://cfx-nui-whip_core/html/img/pad/b.svg" alt="">Back</span><span><img src="https://cfx-nui-whip_core/html/img/pad/lb.svg" alt=""><img src="https://cfx-nui-whip_core/html/img/pad/rb.svg" alt="">Section</span>
+      <span><img src="https://cfx-nui-whip_core/html/img/pad/x.svg" alt="">Refresh</span></footer>` : ''}
+  </div>`;
+}
+
+function renderSheet() {
+  const f = state.form;
+  if (!f) return '';
+  const def = FORMS[f.kind];
+  return `<div class="scrim" style="--brand:${brand()}"><section class="sheet" role="dialog" aria-modal="true" aria-label="${h(def.title(f))}">
+    <header><h2>${h(def.title(f))}</h2><button type="button" class="x" data-k="sheet-x" data-act="closeForm" aria-label="Close">${icon('M6 6l12 12M18 6 6 18')}</button></header>
+    ${f.error ? `<p class="notice error" role="alert">${h(f.error)}</p>` : ''}${def.body(f)}</section></div>`;
+}
+
+// ---------------------------------------------------------------- ATM
+function atmCards() { return (snap().cards || []).filter(c => c.carried && c.status === 'active'); }
+
+function renderAtm() {
+  const s = snap(), a = state.atm, b = s.bank || {};
+  const acct = account();
+  const left = [], right = [];
+  let screen = '';
+  const key = (side, k, label, act, v = '', dis = false) => (side === 'l' ? left : right).push(
+    `<button type="button" class="soft" data-k="${k}" data-act="${act}" data-v="${h(v)}" ${dis || state.busy ? 'disabled' : ''}><span>${h(label)}</span></button>`);
+  if (a.step === 'card') {
+    const cards = atmCards();
+    screen = `<h2>${a.ejected ? 'Please take your card' : 'Welcome'}</h2><p>${cards.length ? 'Choose the card to insert.' : 'You need a debit card in your inventory. Cards are issued at a bank branch.'}</p>
+      <div class="atm-cards">${cards.map(c => `<button type="button" data-k="ins-${c.cardId.slice(-6)}" data-act="insert" data-v="${c.cardId}" ${state.busy ? 'disabled' : ''}>${cardArt(c, accountById(c.accountId))}</button>`).join('')}</div>`;
+    key('r', 'cancel', 'Cancel', 'close');
+  } else if (a.step === 'pin') {
+    screen = `<h2>Enter your PIN</h2><p>Cover the keypad. Three wrong tries lock the card for five minutes.</p>${pinPad(a.pin, '')}`;
+    key('l', 'pin-ok', 'Enter', 'atmPin', '', a.pin.length !== 4);
+    key('r', 'eject', 'Cancel', 'eject');
+  } else if (a.step === 'menu') {
+    const fast = (s.fastCash || []).filter(v => v <= Math.min(acct?.balance || 0, s.limit));
+    screen = `<h2>Hello, ${h((s.characterName || '').split(' ')[0])}</h2><p>${h(acct?.name || '')}. Choose an amount or a service.</p>`;
+    fast.slice(0, 4).forEach((v, i) => key('l', 'fc-' + i, money(v), 'atmCash', v));
+    key('r', 'other', 'Other amount', 'atmOther');
+    key('r', 'bal', 'Balance', 'atmShow', 'balance');
+    key('r', 'mini', 'Mini statement', 'atmShow', 'mini');
+    key('r', 'eject', 'Return card', 'eject');
+  } else if (a.step === 'other') {
+    screen = `<h2>Other amount</h2><p>Whole dollars, up to ${money(Math.min(s.limit, acct?.balance || 0))} at this machine.</p>
+      <button type="button" class="atm-amount" data-k="amt" data-act="atmAmount">${a.amount ? money(a.amount) : '<span class="ph">Type an amount</span>'}</button>`;
+    key('l', 'amt-ok', 'Withdraw', 'atmCash', a.amount, !a.amount);
+    key('r', 'back', 'Back', 'atmMenu');
+  } else if (a.step === 'balance') {
+    screen = `<h2>Your balance</h2><p class="atm-big">${money(acct?.balance)}</p><p>${h(acct?.name || '')}, ${h(acct?.number || '')}</p>`;
+    key('r', 'back', 'Back', 'atmMenu');
+    key('r', 'eject', 'Return card', 'eject');
+  } else if (a.step === 'mini') {
+    screen = `<h2>Mini statement</h2>${ledgerRows(s.recent.slice(0, 5))}`;
+    key('r', 'back', 'Back', 'atmMenu');
+  } else if (a.step === 'receipt') {
+    screen = `<h2>Take your cash</h2><div class="receipt"><span>${h(b.name || 'Bank')} ATM</span><span>${h(fmtFull.format(new Date()))}</span>
+      <span>Withdrawn</span><b>${money(a.last)}</b><span>Available balance</span><b>${money(acct?.balance)}</b><span>Card</span><b>•••• ${h(a.lastFour || '')}</b></div>`;
+    key('l', 'again', 'Another service', 'atmMenu');
+    key('r', 'eject', 'Return card', 'eject');
+  }
+  if (state.busy) screen += `<p class="atm-wait">Please wait…</p>`;
+  return `<div class="atm"><div class="atm-bezel"><header class="atm-head"><b>${h(b.name || 'Bank')}</b><span>${h(fmtTime.format(new Date()))}</span></header>
+    <div class="atm-body"><div class="softs l">${left.join('')}</div><div class="atm-screen">
+      ${state.notice ? `<p class="notice ${state.notice.kind}" role="status">${h(state.notice.text)}</p>` : ''}${screen}</div>
+      <div class="softs r">${right.join('')}</div></div></div>
+    <div class="atm-slot" aria-hidden="true"><i class="${a.step !== 'card' ? 'in' : ''}"></i></div>
+    ${pad ? `<footer class="hints"><span><img src="https://cfx-nui-whip_core/html/img/pad/a.svg" alt="">Select</span><span><img src="https://cfx-nui-whip_core/html/img/pad/b.svg" alt="">Back</span>${a.step === 'pin' ? '<span><img src="https://cfx-nui-whip_core/html/img/pad/x.svg" alt="">Delete</span>' : ''}</footer>` : ''}</div>`;
+}
+
+// ---------------------------------------------------------------- render
+function render() {
+  if (!state) return;
+  const active = document.activeElement?.dataset?.k;
+  app.dataset.mode = snap().mode;
+  app.classList.toggle('pad', pad);
+  app.innerHTML = (atm() ? renderAtm() : renderBranch() + renderSheet());
+  if (active) focusKey(active, false);
+  if (pad && !app.contains(document.activeElement)) focusFirst(state.form ? '.sheet' : '');
+}
+function focusKey(k, scroll = true) {
+  const node = k && app.querySelector(`[data-k="${CSS.escape(k)}"]`);
+  if (!node || node.disabled) return false;
+  node.focus({ preventScroll: !scroll });
+  if (scroll) node.scrollIntoView({ block: 'nearest' });
+  return true;
+}
+function focusFirst(scope) {
+  const root = scope ? app.querySelector(scope) : app;
+  const node = root && [...root.querySelectorAll('button')].find(b => !b.disabled);
+  if (node) { node.focus({ preventScroll: true }); return true; }
+  return false;
+}
+
+// ---------------------------------------------------------------- actions
+const ACTIONS = {
+  close: () => close(),
+  view(v) {
+    state.view = v; state.notice = null; state.returnKey = 'nav-' + v;
+    if (v === 'statement') loadStatement(1);
+    if (v === 'insights' || v === 'overview') loadInsights();
+    render();
+  },
+  selectAccount(_, el) { run(async c => { await reload(c, el.dataset.id); if (c.view === 'insights' || c.view === 'overview') loadInsights(); if (c.view === 'statement') loadStatement(1); }); },
+  move(v) { state.returnKey = 'mv-' + v; openForm('move', {}, { action: v }); },
+  openAccount: () => openForm('openAccount', { kind: 'savings' }),
+  issueCard: () => openForm('issueCard', { pin: '' }),
+  card(v, el) {
+    const a = account(), cardId = el.dataset.card, c = cardsFor(a.id).find(x => x.cardId === cardId);
+    if (!c) return;
+    if (v === 'limit') return openForm('cardLimit', { limit: c.dailyLimit ? String(c.dailyLimit) : '' }, { account: +a.id, card: cardId });
+    if (v === 'rename') return openForm('cardName', { name: c.nickname || '' }, { account: +a.id, card: cardId });
+    if (v === 'revoke') return openForm('confirm', {}, { heading: `Cancel card ${c.lastFour}?`, yes: 'Cancel card', danger: true, done: 'Card cancelled.',
+      text: 'It stops working everywhere at once and cannot be turned back on. Use Freeze if you might find it.',
+      run: () => plus('cardControl', { account: +a.id, card: cardId, action: 'revoke' }) });
+    run(async cur => { await plus('cardControl', { account: +a.id, card: cardId, action: v }); await finish(cur, v === 'freeze' ? 'Card frozen. ATMs refuse it until you unfreeze it.' : 'Card unfrozen.'); });
+  },
+  vaultNew: () => openForm('vaultNew', { colour: 'blue' }),
+  vault(v, el) {
+    const id = el.dataset.id, vault = vaultOf(id);
+    if (!vault) return;
+    if (v === 'in' || v === 'out') return openForm('vaultMove', {}, { vault: id, direction: v });
+    if (v === 'edit') return openForm('vaultEdit', { goal: vault.goal ? String(vault.goal) : '', colour: vault.colour }, { vault: id });
+    if (v === 'close') return openForm('vaultClose', {}, { vault: id });
+  },
+  schedule: () => openForm('schedule', { toKind: 'mine' }),
+  so(v, el) {
+    const id = +el.dataset.id;
+    if (v === 'cancel') return openForm('confirm', {}, { heading: 'Cancel this standing order?', yes: 'Cancel it', danger: true, done: 'Standing order cancelled.',
+      text: 'No more payments go out. Payments already made stay made.', run: () => plus('scheduleControl', { id, action: 'cancel' }) });
+    run(async cur => { await plus('scheduleControl', { id, action: v });
+      await finish(cur, { run: 'Paid. The next one follows on its usual schedule.', pause: 'Paused.', resume: 'Resumed.' }[v]); });
+  },
+  request(v, el) {
+    const id = +el.dataset.id, r = [...(snap().plus?.requests?.incoming || [])].find(x => x.id === id);
+    if (v === 'pay' && r) return openForm('payRequest', {}, { id, amount: r.amount, name: r.name, note: r.note });
+    run(async cur => { await plus('requestAnswer', { id, action: v }); await finish(cur, v === 'decline' ? 'Request declined.' : 'Request withdrawn.'); });
+  },
+  page(v) { loadStatement((state.statement?.page || 1) + +v); },
+  closeForm: () => closeForm(),
+  formBack() { state.form.step = 'edit'; render(); },
+  submit: () => submitForm(),
+  // ATM
+  insert(cardId) {
+    const c = atmCards().find(x => x.cardId === cardId);
+    if (!c) return;
+    run(async cur => {
+      cur.notice = null;
+      await call('insertCard', { accountId: String(c.accountId), cardId });
+      cur.atm = { step: 'pin', pin: '', cardId, accountId: String(c.accountId), lastFour: c.lastFour };
+    });
+  },
+  atmPin() {
+    const a = state.atm;
+    if (a.pin.length !== 4) return;
+    run(async cur => {
+      const pin = a.pin; a.pin = '';
+      try { await call('unlockCard', { accountId: a.accountId, cardId: a.cardId, pin }); }
+      catch (e) { cur.notice = { text: e.message, kind: 'error' }; return; }
+      await reload(cur, a.accountId);
+      cur.notice = null; a.step = 'menu';
+    });
+  },
+  atmMenu() { state.atm.step = 'menu'; state.notice = null; state.atm.amount = 0; render(); },
+  atmShow(v) { state.atm.step = v; render(); },
+  atmOther() { state.atm.step = 'other'; state.atm.amount = 0; render(); },
+  async atmAmount() {
+    if (editing) return;
+    editing = true;
+    try { const r = await call('editField', { field: 'atm-amount', value: state.atm.amount ? String(state.atm.amount) : '' });
+      if (state && r && !r.cancelled) state.atm.amount = whole(r.value); }
+    catch (e) { if (state) state.notice = { text: e.message, kind: 'error' }; }
+    finally { editing = false; render(); }
+  },
+  atmCash(v) {
+    const amount = whole(v), a = state.atm, acct = account();
+    if (!amount) return;
+    if (amount > (acct?.balance || 0)) return notice('Your balance is too low for that.', 'error');
+    if (amount > snap().limit) return notice(`This machine pays up to ${money(snap().limit)} at a time.`, 'error');
+    run(async cur => {
+      await call('withdraw', { accountId: acct.id, amount, requestId: uuid() });
+      a.last = amount; a.step = 'receipt';
+      try { await reload(cur, acct.id); } catch { /* the receipt still stands */ }
+    });
+  },
+  eject() {
+    run(async cur => {
+      try { await call('ejectCard'); } catch { /* the session may have ended */ }
+      cur.atm = { step: 'card', pin: '', ejected: true };
+      cur.notice = null;
+      try { await reload(cur, 0); } catch { /* keep the old list */ }
+    });
+  },
+};
+
+async function loadStatement(page) {
+  const current = state, a = account();
+  if (!a) return;
+  current.statement = current.statement && current.statement.accountId === a.id ? current.statement : null;
+  render();
   try {
-    await call('close');
-    if (session === current) hide();
-  } catch (error) {
-    if (session !== current) return;
-    current.closing = false;
-    updateControls();
-    notice(error.message, 'error');
-  }
+    const st = await call('getStatement', { accountId: a.id, page });
+    if (state === current) { st.accountId = a.id; current.statement = st; render(); }
+  } catch (e) { if (state === current) notice(e.message, 'error'); }
+}
+async function loadInsights() {
+  const current = state, a = account();
+  if (!a) return;
+  current.insightsError = null;
+  try { const i = await plus('insights', { account: +a.id }); if (state === current) { current.insights = i; render(); } }
+  catch (e) { if (state === current) { current.insightsError = e.message; render(); } }
 }
 
+function pinInput(k) {
+  const target = state.atm && state.atm.step === 'pin' ? state.atm : state.form?.values;
+  if (!target) return;
+  const v = target.pin || '';
+  target.pin = k === 'del' ? v.slice(0, -1) : k === 'clear' ? '' : v.length < 4 ? v + k : v;
+  render();
+}
+
+app.addEventListener('click', e => {
+  const el = e.target.closest('button');
+  if (!el || el.disabled || !state || editing) return;
+  if (el.dataset.pin) return pinInput(el.dataset.pin);
+  if (el.dataset.edit) return editField(el.dataset.edit, el.dataset.key);
+  if (el.dataset.set && state.form) { state.form.values[el.dataset.set] = el.dataset.v; state.form.error = null; return render(); }
+  const act = el.dataset.act;
+  if (act && ACTIONS[act] && !(state.busy && act !== 'close')) ACTIONS[act](el.dataset.v, el);
+});
+
+// ---------------------------------------------------------------- open / close
 async function open(event) {
   if (!event || event.type !== 'bank:open' || !event.snapshot || event.generation <= latestGeneration) return;
   latestGeneration = event.generation;
-  const snapshot = event.snapshot;
-  snapshot.accounts = Array.isArray(snapshot.accounts) ? snapshot.accounts : [];
-  snapshot.recent = Array.isArray(snapshot.recent) ? snapshot.recent : [];
-  const current = { snapshot, action: null, statement: null, busy: true, stale: false };
-  session = current;
-  notice();
-  theme(snapshot.theme);
-  setAction(null);
-  renderSnapshot();
-  bank.hidden = false;
+  const s = event.snapshot;
+  normalise(s);
+  const current = { snapshot: s, view: 'overview', busy: true, form: null, notice: null,
+    atm: { step: s.atmAccountId ? 'menu' : 'card', pin: '' } };
+  state = current;
+  theme(s.theme);
+  app.hidden = false;
+  render();
   try {
     const rendered = await call('rendered', { generation: event.generation });
-    if (session !== current) return;
+    if (state !== current) return;
     current.busy = false;
-    updateControls();
-    setController(rendered?.pad === true);
-    if (!controllerActive) bank.focus({ preventScroll: true });
-  } catch {
-    if (session === current) hide();
+    setPad(rendered?.pad === true);
+    render();
+    if (!atm()) loadInsights();
+    if (!pad) app.focus({ preventScroll: true });
+  } catch { if (state === current) hide(); }
+}
+function hide() { state = null; app.hidden = true; app.innerHTML = ''; }
+async function close() {
+  const current = state;
+  if (!current || current.closing) return;
+  current.closing = true;
+  try { await call('close'); if (state === current) hide(); }
+  catch (e) { if (state === current) { current.closing = false; notice(e.message, 'error'); } }
+}
+function theme(name) {
+  $('whip-theme')?.remove();
+  if (typeof name !== 'string' || !/^[\w-]+$/.test(name)) return;
+  const link = Object.assign(document.createElement('link'), { id: 'whip-theme', rel: 'stylesheet', href: `https://cfx-nui-${name}/theme.css` });
+  document.head.append(link);
+}
+
+// ---------------------------------------------------------------- controller + keys
+function setPad(on) { if (pad === on) return; pad = on; render(); }
+function back() {
+  if (!state || editing) return;
+  if (state.form) return state.form.step === 'review' ? ACTIONS.formBack() : closeForm();
+  if (atm()) {
+    const step = state.atm.step;
+    if (['other', 'balance', 'mini', 'receipt'].includes(step)) return ACTIONS.atmMenu();
+    if (step === 'pin' || step === 'menu') return ACTIONS.eject();
+    return close();
   }
-}
-
-el('card-form').addEventListener('submit', event => {
-  event.preventDefault();
-  run(async current => {
-    const pin = el('card-pin').value;
-    el('card-pin').value = '';
-    if (!/^[0-9]{4}$/.test(pin)) throw new Error('Enter a four-digit PIN.');
-    const atm = current.snapshot.mode === 'atm';
-    const cardId = el('card-select').value;
-    const accountId = selected().id;
-    if (!atm && current.cardRequest?.accountId !== accountId) {
-      current.cardRequest = { accountId, requestId: crypto.randomUUID() };
-    }
-    await call(atm ? 'unlockCard' : 'issueCard', { accountId, cardId, pin, requestId: current.cardRequest?.requestId });
-    current.cardRequest = null;
-    if (session !== current) return;
-    notice(atm ? 'Card verified. Refreshing account…' : 'Debit card issued. Refreshing cards…', 'success');
-    await reloadCards(current, atm ? 'Card verified.' : 'Debit card issued to your inventory.');
-  });
-});
-el('card-list').addEventListener('click', event => {
-  const button = event.target.closest('[data-card-action]');
-  if (!button) return;
-  run(async current => {
-    await call('manageCard', { accountId: selected().id, cardId: button.dataset.card, action: button.dataset.cardAction });
-    if (session !== current) return;
-    await reloadCards(current, 'Card updated.');
-  });
-});
-el('accounts-nav').addEventListener('click', () => {
-  session.management = true;
-  session.statement = null;
-  el('account-form').hidden = false;
-  renderActivity();
-  focusControl(el('account-name'));
-});
-el('new-account').addEventListener('click', () => {
-  session.management = true;
-  session.statement = null;
-  renderActivity();
-  el('account-form').hidden = false;
-  el('account-name').focus();
-});
-el('cancel-account').addEventListener('click', () => {
-  el('account-form').hidden = true;
-  el('accounts-nav').focus();
-});
-el('account-form').addEventListener('submit', event => {
-  event.preventDefault();
-  run(async current => {
-    notice('Creating account…');
-    const result = await call('createAccount', {
-      label: el('account-name').value.trim(),
-      kind: el('account-kind').value,
-    });
-    if (session !== current) return;
-    el('account-form').hidden = true;
-    current.stale = true;
-    setAction(null);
-    try {
-      current.snapshot = await call('getBankSnapshot', { accountId: result.accountId });
-      if (session !== current) return;
-      current.statement = null;
-      current.stale = false;
-      renderSnapshot();
-      notice('Account created.', 'success');
-    } catch {
-      notice('Account created. Refresh balances to load your account list.', 'success');
-    }
-  });
-});
-el('close').addEventListener('click', close);
-el('refresh').addEventListener('click', () => refresh());
-el('account').addEventListener('change', event => refresh(event.target.value));
-function showOverview() {
-  if (!session.statement && !session.management) return;
-  session.management = false;
-  notice();
-  session.statement = null;
-  renderActivity();
-  updateControls();
-}
-el('overview-nav').addEventListener('click', showOverview);
-el('transactions-nav').addEventListener('click', () => {
-  if (!session.statement) openStatement(1);
-});
-el('statement').addEventListener('click', () => {
-  if (session.statement) showOverview();
-  else openStatement(1);
-});
-el('previous').addEventListener('click', () => openStatement(session.statement.page - 1));
-el('next').addEventListener('click', () => openStatement(session.statement.page + 1));
-el('actions').addEventListener('click', event => {
-  const action = event.target.closest('[data-action]')?.dataset.action;
-  if (!action || session.busy) return;
-  notice();
-  setAction(action, true);
-  if (action === 'deposit' || action === 'withdraw') {
-    const current = session;
-    editInput(el('amount'), true).then(committed => {
-      if (committed && session === current && current.action === action) el('move').requestSubmit();
-    });
-  }
-});
-function cancel() {
-  const button = actions.find(item => item.dataset.action === session.action);
-  setAction(null);
-  notice();
-  button?.focus();
-}
-el('cancel').addEventListener('click', cancel);
-el('quick-cash').addEventListener('click', event => {
-  const preset = event.target.closest('[data-amount]');
-  if (!preset || !session || session.busy || session.confirmation) return;
-  el('amount').value = preset.dataset.amount;
-  el('move').requestSubmit();
-});
-el('move').addEventListener('submit', event => {
-  event.preventDefault();
-  run(current => current.confirmation ? submit(current) : buildConfirmation(current));
-});
-document.addEventListener('keydown', event => {
-  if (event.key === 'Escape' && previewSequence !== null) { event.preventDefault(); closeCardPreview(); return; }
-  if (event.key !== 'Escape' || !session || event.repeat) return;
-  event.preventDefault();
-  if (session.busy || session.closing) return;
-  goBack();
-});
-window.addEventListener('message', event => {
-  if (event.data?.type === 'card:open') return showCardPreview(event.data);
-  if (event.data?.type === 'card:close') return hideCardPreview();
-  if (event.data?.action === 'padDevice' && previewSequence !== null) return;
-  if (event.data?.action === 'padDevice') return setController(event.data.pad === true);
-  if (event.data?.action === 'pad') return onPad(event.data);
-  if (event.data?.type === 'bank:close') hide();
-  else open(event.data).catch(report);
-});
-
-
-function availableControls() {
-  const root = dropdownSelect ? el('controller-dropdown') : el('pin-pad').hidden ? bank : el('pin-pad');
-  return [...root.querySelectorAll('button, input, select')].filter(node =>
-    !node.disabled && node.getClientRects().length && getComputedStyle(node).visibility !== 'hidden');
-}
-
-function focusControl(node) {
-  if (!node) return;
-  node.focus({ preventScroll: true });
-  node.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-  updateFocusMarker();
-}
-
-function ensurePadFocus() {
-  const controls = availableControls();
-  if (!controls.includes(document.activeElement)) {
-    focusControl(controls.find(node => node.id === 'account') || controls[0]);
-  }
-}
-
-function setController(on) {
-  controllerActive = on;
-  bank.classList.toggle('controller-active', on);
-  el('pad-hints').hidden = !on;
-  if (on && session) ensurePadFocus();
-  updateFocusMarker();
-}
-
-function goBack() {
-  if (dropdownSelect) return closeDropdown(false);
-  if (!el('pin-pad').hidden) return closePinPad(false);
-  if (session?.busy || editingField) return;
-  if (!el('account-form').hidden) {
-    el('account-form').hidden = true;
-    return focusControl(el('accounts-nav'));
-  }
-  if (session?.action) return cancel();
-  if (session?.statement || session?.management) {
-    showOverview();
-    return focusControl(el('overview-nav'));
-  }
+  if (state.view !== 'overview') return ACTIONS.view('overview');
   close();
 }
-
-function stepSelect(select, direction) {
-  if (select.disabled || !select.options.length) return;
-  const next = Math.max(0, Math.min(select.options.length - 1, select.selectedIndex + direction));
-  if (next === select.selectedIndex) return;
-  select.selectedIndex = next;
-  select.dispatchEvent(new Event('change', { bubbles: true }));
+function moveFocus(dir) {
+  const scope = state.form ? app.querySelector('.sheet') : app;
+  const nodes = [...scope.querySelectorAll('button')].filter(n => !n.disabled && n.getClientRects().length);
+  const cur = document.activeElement;
+  if (!nodes.includes(cur)) return nodes[0]?.focus();
+  const a = cur.getBoundingClientRect(), ax = a.left + a.width / 2, ay = a.top + a.height / 2;
+  const v = dir === 'up' || dir === 'down', sign = dir === 'up' || dir === 'left' ? -1 : 1;
+  const best = nodes.filter(n => n !== cur).map(n => {
+    const b = n.getBoundingClientRect(), dx = b.left + b.width / 2 - ax, dy = b.top + b.height / 2 - ay;
+    const fwd = (v ? dy : dx) * sign;
+    return { n, fwd, score: fwd + Math.abs(v ? dx : dy) * 2.5 };
+  }).filter(x => x.fwd > 4).sort((x, y) => x.score - y.score)[0];
+  if (best) { best.n.focus({ preventScroll: true }); best.n.scrollIntoView({ block: 'nearest' }); }
 }
-
-function moveFocus(direction) {
-  ensurePadFocus();
-  const current = document.activeElement;
-  const start = current.getBoundingClientRect();
-  const sx = start.left + start.width / 2;
-  const sy = start.top + start.height / 2;
-  const vertical = direction === 'up' || direction === 'down';
-  const sign = direction === 'up' || direction === 'left' ? -1 : 1;
-  const candidates = availableControls().filter(node => node !== current).map(node => {
-    const box = node.getBoundingClientRect();
-    const dx = box.left + box.width / 2 - sx;
-    const dy = box.top + box.height / 2 - sy;
-    const forward = (vertical ? dy : dx) * sign;
-    const cross = Math.abs(vertical ? dx : dy);
-    return { node, forward, score: forward + cross * 3 };
-  }).filter(item => item.forward > 4).sort((a, b) => a.score - b.score);
-  focusControl(candidates[0]?.node);
-}
-
-function updateFocusMarker() {
-  const marker = el('controller-focus');
-  const node = document.activeElement;
-  const visible = controllerActive && session && !bank.hidden && !editingField
-    && node !== bank && bank.contains(node) && node.getClientRects().length > 0;
-  marker.hidden = !visible;
-  if (!visible) return;
-  const box = node.getBoundingClientRect();
-  marker.style.left = box.left - 4 + 'px';
-  marker.style.top = box.top - 4 + 'px';
-  marker.style.width = box.width + 8 + 'px';
-  marker.style.height = box.height + 8 + 'px';
-}
-document.addEventListener('focusin', updateFocusMarker);
-document.addEventListener('scroll', updateFocusMarker, true);
-window.addEventListener('resize', updateFocusMarker);
-
-function highlightDropdown() {
-  for (const button of el('dropdown-options').children) {
-    const active = Number(button.dataset.index) === dropdownIndex;
-    button.setAttribute('aria-selected', String(active));
-    if (active) focusControl(button);
-  }
-}
-function openDropdown(select) {
-  if (select.disabled || !select.options.length) return;
-  dropdownSelect = select;
-  dropdownIndex = select.selectedIndex;
-  const label = document.querySelector('label[for="' + select.id + '"]');
-  el('dropdown-title').textContent = label?.textContent || 'Select an option';
-  el('dropdown-options').replaceChildren(...[...select.options].filter(option => !option.disabled).map(option => {
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.role = 'option';
-    button.dataset.index = option.index;
-    button.textContent = option.textContent;
-    button.addEventListener('click', () => { dropdownIndex = option.index; closeDropdown(true); });
-    return button;
-  }));
-  select.setAttribute('aria-expanded', 'true');
-  el('controller-dropdown').hidden = false;
-  const panel = el('controller-dropdown').firstElementChild;
-  const rect = select.getBoundingClientRect();
-  const width = Math.min(Math.max(rect.width, 280), window.innerWidth - 32);
-  panel.style.width = width + 'px';
-  panel.style.left = Math.min(Math.max(16, rect.left), window.innerWidth - width - 16) + 'px';
-  const height = panel.getBoundingClientRect().height;
-  const top = rect.bottom + 8 + height <= window.innerHeight - 16 ? rect.bottom + 8 : rect.top - height - 8;
-  panel.style.top = Math.max(16, Math.min(top, window.innerHeight - height - 16)) + 'px';
-  highlightDropdown();
-}
-function closeDropdown(commit) {
-  if (!dropdownSelect) return;
-  const select = dropdownSelect;
-  dropdownSelect = null;
-  el('controller-dropdown').hidden = true;
-  select.setAttribute('aria-expanded', 'false');
-  if (commit && select.selectedIndex !== dropdownIndex) {
-    select.selectedIndex = dropdownIndex;
-    select.dispatchEvent(new Event('change', { bubbles: true }));
-  }
-  if (session) focusControl(select);
-}
-
-function refreshPinPad() {
-  el('pin-display').textContent = '●'.repeat(pinDraft.length) + '○'.repeat(4 - pinDraft.length);
-  el('pin-done').disabled = pinDraft.length !== 4;
-}
-
-function openPinPad(input) {
-  pinReturn = input;
-  pinDraft = '';
-  el('pin-pad').hidden = false;
-  refreshPinPad();
-  focusControl(el('pin-pad').querySelector('[data-digit="7"]'));
-}
-
-function closePinPad(commit) {
-  if (el('pin-pad').hidden) return;
-  if (commit && pinDraft.length !== 4) return;
-  if (commit && pinReturn) {
-    pinReturn.value = pinDraft;
-    pinReturn.dispatchEvent(new Event('input', { bubbles: true }));
-  }
-  pinDraft = '';
-  el('pin-display').textContent = '';
-  el('pin-pad').hidden = true;
-  const restore = pinReturn;
-  pinReturn = null;
-  if (session) focusControl(restore);
-}
-
-async function editInput(input, automatic = false) {
-  if (input.id === 'card-pin') return openPinPad(input);
-  const current = session;
-  editingField = true;
-  try {
-    const result = await call('editField', {
-      field: input.id, value: input.value, action: session.action,
-      accountName: selected()?.name, auto: automatic
-    });
-    if (session === current && result && !result.cancelled) {
-      input.value = result.value;
-      input.dispatchEvent(new Event('input', { bubbles: true }));
-      return true;
-    }
-  } catch (error) {
-    if (session === current) notice(error.message, 'error');
-  } finally {
-    editingField = false;
-    if (session === current) focusControl(input);
-  }
-}
-
-function onPad(event) {
-  if (previewSequence !== null) {
-    if (event.down !== false && (event.cmd === 'b' || event.cmd === 'a')) closeCardPreview();
+function onPad(e) {
+  if (previewSequence !== null) { if (e.down !== false && (e.cmd === 'b' || e.cmd === 'a')) closeCardPreview(); return; }
+  if (!state || app.hidden || e.down === false) return;
+  setPad(true);
+  if (editing || state.busy) return;
+  if (e.cmd === 'b') return back();
+  if (['up', 'down', 'left', 'right'].includes(e.cmd)) return moveFocus(e.cmd);
+  if (e.cmd === 'x') {
+    if (atm() && state.atm.step === 'pin') return pinInput('del');
+    if (!atm() && !state.form) return run(c => reload(c));
     return;
   }
-  if (!session || bank.hidden || event.down === false) return;
-  setController(true);
-  if (editingField || session.busy || session.closing) return;
-  if (dropdownSelect) {
-    if (event.cmd === 'b') return closeDropdown(false);
-    if (event.cmd === 'a') return closeDropdown(true);
-    if (event.cmd === 'up' || event.cmd === 'down') {
-      const options = [...dropdownSelect.options].filter(option => !option.disabled);
-      const change = event.cmd === 'up' ? -1 : 1;
-      const active = options.findIndex(option => option.index === dropdownIndex);
-      dropdownIndex = options[Math.max(0, Math.min(options.length - 1, active + change))]?.index ?? dropdownIndex;
-      highlightDropdown();
-    }
-    return;
+  if ((e.cmd === 'lb' || e.cmd === 'rb') && !atm() && !state.form) {
+    const i = VIEWS.findIndex(v => v[0] === state.view);
+    const next = VIEWS[(i + (e.cmd === 'rb' ? 1 : -1) + VIEWS.length) % VIEWS.length][0];
+    ACTIONS.view(next);
+    return focusKey('nav-' + next);
   }
-  if (event.cmd === 'b') return goBack();
-  if (['up', 'down', 'left', 'right'].includes(event.cmd)) return moveFocus(event.cmd);
-  if (!el('pin-pad').hidden) {
-    if (event.cmd === 'x') return el('pin-delete').click();
-    if (event.cmd === 'rb' && !el('pin-done').disabled) return el('pin-done').click();
-    if (event.cmd === 'a') document.activeElement?.click();
-    return;
-  }
-  if (event.cmd === 'lb' || event.cmd === 'rb') {
-    return openDropdown(el('account'));
-  }
-  if (event.cmd === 'x') {
-    if (!el('refresh').disabled) refresh();
-    return;
-  }
-  if (event.cmd !== 'a') return;
-  ensurePadFocus();
-  const node = document.activeElement;
-  if (node.tagName === 'INPUT') editInput(node);
-  else if (node.tagName === 'SELECT') openDropdown(node);
-  else node.click();
+  if (e.cmd === 'rb' && state.form?.kind === 'issueCard') return submitForm();
+  if (e.cmd === 'a') { if (!app.contains(document.activeElement)) focusFirst(state.form ? '.sheet' : ''); document.activeElement?.click(); }
 }
-
-el('pin-pad').addEventListener('click', event => {
-  const digit = event.target.closest('[data-digit]')?.dataset.digit;
-  if (digit && pinDraft.length < 4) {
-    pinDraft += digit;
-    refreshPinPad();
-  }
+document.addEventListener('keydown', e => {
+  if (previewSequence !== null && e.key === 'Escape') { e.preventDefault(); return closeCardPreview(); }
+  if (!state || editing) return;
+  if (e.key === 'Escape') { e.preventDefault(); return back(); }
+  const pinOpen = (atm() && state.atm.step === 'pin') || state.form?.kind === 'issueCard';
+  if (pinOpen && /^\d$/.test(e.key)) return pinInput(e.key);
+  if (pinOpen && e.key === 'Backspace') return pinInput('del');
+  if (pinOpen && e.key === 'Enter') { e.preventDefault(); return atm() ? ACTIONS.atmPin() : submitForm(); }
 });
-el('amount').addEventListener('click', () => { if (session && !editingField && !session.busy) editInput(el('amount')); });
-el('card-pin').addEventListener('click', () => { if (session && !session.busy) openPinPad(el('card-pin')); });
-el('pin-delete').addEventListener('click', () => {
-  pinDraft = pinDraft.slice(0, -1);
-  refreshPinPad();
-});
-el('pin-done').addEventListener('click', () => closePinPad(true));
-el('pin-cancel').addEventListener('click', () => closePinPad(false));
-new MutationObserver(() => {
-  if (controllerActive && session && !bank.hidden && !editingField) ensurePadFocus();
-}).observe(bank, { subtree: true, childList: true, attributes: true, attributeFilter: ['hidden', 'disabled'] });
+document.addEventListener('mousemove', () => { if (pad && state) setPad(false); }, { passive: true });
 
+window.addEventListener('message', e => {
+  const d = e.data || {};
+  if (d.type === 'card:open') return showCardPreview(d);
+  if (d.type === 'card:close') return hideCardPreview();
+  if (d.action === 'padDevice') return previewSequence === null && setPad(d.pad === true);
+  if (d.action === 'pad') return onPad(d);
+  if (d.type === 'bank:close') return hide();
+  open(d).catch(report);
+});
+
+// ---------------------------------------------------------------- card preview (using a card from the inventory)
 function hideCardPreview() {
   previewSequence = null;
-  el('card-preview').hidden = true;
-  for (const id of ['preview-holder', 'preview-account-name', 'preview-account-number', 'preview-card-status', 'preview-last-four', 'preview-error']) {
-    el(id).textContent = '';
-  }
+  $('card-preview').hidden = true;
+  for (const id of ['preview-holder', 'preview-account-name', 'preview-account-number', 'preview-card-status', 'preview-last-four', 'preview-error']) $(id).textContent = '';
 }
 async function showCardPreview(event) {
-  if (session || !event.card || !Number.isInteger(event.sequence)) return;
+  if (state || !event.card || !Number.isInteger(event.sequence)) return;
   previewSequence = event.sequence;
-  el('preview-holder').textContent = event.card.holder || 'Account holder';
-  el('preview-account-name').textContent = event.card.accountName || 'Account';
-  el('preview-account-number').textContent = event.card.accountNumber || '';
-  el('preview-card-status').textContent = event.card.status ? event.card.status[0].toUpperCase() + event.card.status.slice(1) : 'Unavailable';
-  el('preview-card-status').dataset.status = event.card.status;
-  el('preview-last-four').textContent = 'Card · ' + (event.card.lastFour || '');
-  el('preview-error').textContent = '';
-  el('card-preview').hidden = false;
-  try {
-    await call('cardReady', { sequence: event.sequence });
-    if (previewSequence === event.sequence) el('card-preview-close').focus();
-  } catch {
-    if (previewSequence === event.sequence) hideCardPreview();
-  }
+  const c = event.card;
+  $('preview-holder').textContent = c.holder || 'Account holder';
+  $('preview-account-name').textContent = c.accountName || 'Account';
+  $('preview-account-number').textContent = c.accountNumber || '';
+  $('preview-card-status').textContent = c.status ? c.status[0].toUpperCase() + c.status.slice(1) : 'Unavailable';
+  $('preview-card-status').dataset.status = c.status;
+  $('preview-last-four').textContent = 'Card ending ' + (c.lastFour || '');
+  $('card-preview').hidden = false;
+  try { await call('cardReady', { sequence: event.sequence }); if (previewSequence === event.sequence) $('card-preview-close').focus(); }
+  catch { if (previewSequence === event.sequence) hideCardPreview(); }
 }
 async function closeCardPreview() {
-  const sequence = previewSequence;
-  try { await call('cardClose'); if (sequence === previewSequence) hideCardPreview(); }
-  catch { el('preview-error').textContent = 'Could not close the card. Try again.'; }
+  const seq = previewSequence;
+  try { await call('cardClose'); if (seq === previewSequence) hideCardPreview(); }
+  catch { $('preview-error').textContent = 'The card did not close. Try again.'; }
 }
-el('card-preview-close').addEventListener('click', closeCardPreview);
+$('card-preview-close').addEventListener('click', closeCardPreview);
 
-function report(error) {
-  call('uiError', { message: String(error).slice(0, 400) }).catch(() => {});
-}
-window.addEventListener('error', event => report(event.message));
-call('ready').then(event => event?.type === 'card:open' ? showCardPreview(event) : open(event)).catch(report);
-
+function report(error) { call('uiError', { message: String(error).slice(0, 400) }).catch(() => {}); }
+window.addEventListener('error', e => report(e.message));
+call('ready').then(e => (e?.type === 'card:open' ? showCardPreview(e) : open(e))).catch(report);

@@ -4,28 +4,47 @@ local ready = false
 local item = 'whip_debit_card'
 local previewPermits = {}
 
-CreateThread(function()
-    local ok, err = pcall(function()
-        return MySQL.query.await([[
-            CREATE TABLE IF NOT EXISTS whip_banking_cards (
-                cardId CHAR(36) NOT NULL PRIMARY KEY,
-                requestId VARCHAR(64) NOT NULL,
-                accountId INT UNSIGNED NOT NULL,
-                charId INT UNSIGNED NOT NULL,
-                pinSalt CHAR(36) NOT NULL,
-                pinHash CHAR(64) NOT NULL,
-                status VARCHAR(12) NOT NULL DEFAULT 'pending',
-                attempts INT NOT NULL DEFAULT 0,
-                lockedUntil BIGINT NOT NULL DEFAULT 0,
-                createdAt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE KEY issue_request (charId, requestId),
-                INDEX owner_account (charId, accountId)
-            )
-        ]])
+local CREATE = [[
+    CREATE TABLE IF NOT EXISTS whip_banking_cards (
+        cardId CHAR(36) NOT NULL PRIMARY KEY,
+        requestId VARCHAR(64) NOT NULL,
+        accountId INT UNSIGNED NOT NULL,
+        charId INT UNSIGNED NOT NULL,
+        pinSalt CHAR(36) NOT NULL,
+        pinHash CHAR(64) NOT NULL,
+        status VARCHAR(12) NOT NULL DEFAULT 'pending',
+        attempts INT NOT NULL DEFAULT 0,
+        lockedUntil BIGINT NOT NULL DEFAULT 0,
+        dailyLimit INT UNSIGNED NOT NULL DEFAULT 0,
+        spentDay INT UNSIGNED NOT NULL DEFAULT 0,
+        spentToday INT UNSIGNED NOT NULL DEFAULT 0,
+        nickname VARCHAR(24) NULL,
+        lastUsedAt BIGINT NOT NULL DEFAULT 0,
+        createdAt TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY issue_request (charId, requestId),
+        INDEX owner_account (charId, accountId)
+    )
+]]
+-- Card controls (2.1): a daily ATM limit, a nickname, the last use. Added to tables made by 2.0.
+local MIGRATIONS = { { id = 'card-controls', statements = {
+    { sql = 'ALTER TABLE whip_banking_cards ADD COLUMN dailyLimit INT UNSIGNED NOT NULL DEFAULT 0', unless = { column = { 'whip_banking_cards', 'dailyLimit' } } },
+    { sql = 'ALTER TABLE whip_banking_cards ADD COLUMN spentDay INT UNSIGNED NOT NULL DEFAULT 0', unless = { column = { 'whip_banking_cards', 'spentDay' } } },
+    { sql = 'ALTER TABLE whip_banking_cards ADD COLUMN spentToday INT UNSIGNED NOT NULL DEFAULT 0', unless = { column = { 'whip_banking_cards', 'spentToday' } } },
+    { sql = 'ALTER TABLE whip_banking_cards ADD COLUMN nickname VARCHAR(24) NULL', unless = { column = { 'whip_banking_cards', 'nickname' } } },
+    { sql = 'ALTER TABLE whip_banking_cards ADD COLUMN lastUsedAt BIGINT NOT NULL DEFAULT 0', unless = { column = { 'whip_banking_cards', 'lastUsedAt' } } },
+} } }
+
+-- whip_core forgets nothing about tables, but EnsureTable waits for it: run it on every (re)start, in a thread.
+Whip.register(function()
+    CreateThread(function()
+        local ok, why = Whip.core:EnsureTable('whip_banking_cards', CREATE, MIGRATIONS)
+        ready = ok == true
+        if not ready then print('[whip_banking] Card storage unavailable: ' .. tostring(why)) end
     end)
-    ready = ok and err ~= nil
-    if not ok then print('[whip_banking] Card storage unavailable: ' .. tostring(err)) end
 end)
+
+--- Today's number (UTC days since 1970): a card's spend resets when it changes.
+local function today() return os.time() // 86400 end
 
 local function held(source, cardId)
     local items, why = core:FindAllItems(source, item)
@@ -39,12 +58,16 @@ end
 function BankingCards.list(source, charId)
     if not ready then return {}, 'Card service is unavailable.' end
     local rows = MySQL.query.await(
-        "SELECT cardId, accountId, status FROM whip_banking_cards WHERE charId = ? AND status IN ('active', 'blocked') ORDER BY createdAt",
+        "SELECT cardId, accountId, status, dailyLimit, spentDay, spentToday, nickname, lastUsedAt FROM whip_banking_cards WHERE charId = ? AND status IN ('active', 'blocked') ORDER BY createdAt",
         { charId })
     if not rows then return {}, 'Card service is unavailable.' end
     for _, card in ipairs(rows) do
         card.lastFour = card.cardId:gsub('%-', ''):sub(-4):upper()
-        card.carried = held(source, card.cardId)
+        card.carried = source and held(source, card.cardId) or false
+        card.dailyLimit = tonumber(card.dailyLimit) or 0
+        card.spentToday = tonumber(card.spentDay) == today() and tonumber(card.spentToday) or 0
+        card.spentDay = nil
+        card.lastUsedAt = tonumber(card.lastUsedAt) or 0
     end
     return rows
 end
@@ -101,6 +124,63 @@ function BankingCards.manage(charId, accountId, cardId, action)
     ]], { status, cardId, charId, accountId })
     if affected ~= 1 then return false, 'This card is unavailable.' end
     return true
+end
+
+--- A card's daily ATM limit (0: none, the ATM's own per-withdrawal limit still applies).
+function BankingCards.setLimit(charId, accountId, cardId, limit)
+    if not ready then return false, 'Card service is unavailable.' end
+    limit = math.tointeger(tonumber(limit))
+    if not limit or limit < 0 or limit > Config.Cards.MaxDailyLimit then
+        return false, ('Choose a daily limit from $0 (none) to $%d.'):format(Config.Cards.MaxDailyLimit)
+    end
+    local affected = MySQL.update.await([[
+        UPDATE whip_banking_cards SET dailyLimit = ?
+        WHERE cardId = ? AND charId = ? AND accountId = ? AND status IN ('active', 'blocked')
+    ]], { limit, cardId, charId, accountId })
+    if affected ~= 1 then return false, 'This card is unavailable.' end
+    return true
+end
+
+function BankingCards.rename(charId, accountId, cardId, name)
+    if not ready then return false, 'Card service is unavailable.' end
+    name = type(name) == 'string' and name:gsub('%c', ''):match('^%s*(.-)%s*$') or ''
+    if #name > 24 then return false, 'Keep the card name under 24 characters.' end
+    local affected = MySQL.update.await([[
+        UPDATE whip_banking_cards SET nickname = ?
+        WHERE cardId = ? AND charId = ? AND accountId = ? AND status IN ('active', 'blocked')
+    ]], { name ~= '' and name or nil, cardId, charId, accountId })
+    if affected ~= 1 then return false, 'This card is unavailable.' end
+    return true
+end
+
+--- Claim `amount` of the card's daily limit before the money moves; `unspend` gives it back if the withdrawal fails.
+--- One conditional UPDATE, so two ATMs at once cannot both pass the limit.
+function BankingCards.spend(cardId, amount)
+    if not ready then return false, 'Card service is unavailable.' end
+    local day = today()
+    local affected = MySQL.update.await([[
+        UPDATE whip_banking_cards
+        SET spentToday = IF(spentDay = ?, spentToday, 0) + ?, spentDay = ?, lastUsedAt = UNIX_TIMESTAMP()
+        WHERE cardId = ? AND status = 'active'
+          AND (dailyLimit = 0 OR IF(spentDay = ?, spentToday, 0) + ? <= dailyLimit)
+    ]], { day, amount, day, cardId, day, amount })
+    if affected ~= 1 then
+        local card = MySQL.single.await('SELECT dailyLimit, spentDay, spentToday FROM whip_banking_cards WHERE cardId = ?', { cardId })
+        if card and tonumber(card.dailyLimit) > 0 then
+            local left = tonumber(card.dailyLimit) - (tonumber(card.spentDay) == day and tonumber(card.spentToday) or 0)
+            return false, ('This card can withdraw $%d more today.'):format(math.max(0, left))
+        end
+        return false, 'This debit card is unavailable.'
+    end
+    return true
+end
+
+function BankingCards.unspend(cardId, amount)
+    if not ready then return false end
+    return MySQL.update.await([[
+        UPDATE whip_banking_cards SET spentToday = IF(spentToday >= ?, spentToday - ?, 0)
+        WHERE cardId = ? AND spentDay = ?
+    ]], { amount, amount, cardId, today() }) == 1
 end
 
 function BankingCards.authorize(source, player, accountId, cardId, pin)
