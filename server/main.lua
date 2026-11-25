@@ -4,8 +4,6 @@ local terminals, receipts, busy = {}, {}, {}
 local pageSize = 12
 local insertions = {}
 local atmOrigins = {}
-local atmModels = {}
-for _, model in ipairs(Config.AtmModels) do atmModels[GetHashKey(model) % 4294967296] = true end
 
 local function near(source, terminal)
     local ped = GetPlayerPed(source)
@@ -76,7 +74,8 @@ local function snapshot(source, player, session, selectedId)
     if selectedId ~= 0 and not selected then return false, 'This account is unavailable.' end
     selected = selected or default or accounts[1]
     local recent = {}
-    if selected and session.terminal.mode == 'bank' then
+    local unlocked = session.terminal.mode == 'atm' and selected and session.atmAccountId == tonumber(selected.id)
+    if selected and (session.terminal.mode == 'bank' or unlocked) then
         local id = tonumber(selected.id)
         local allowed, refusal = core:CanUseBankAccount(id, { charId = player.charId }, 'view')
         if not allowed then return false, refusal end
@@ -91,7 +90,14 @@ local function snapshot(source, player, session, selectedId)
     if type(cash) ~= 'number' then return false, err or 'Cash balance unavailable.' end
     local readCards, cards, cardError = pcall(BankingCards.list, source, player.charId)
     if not readCards then cards, cardError = {}, 'Card service is unavailable.' end
+    local plus
+    if session.terminal.mode == 'bank' then
+        plus = BankingPlus.run(source, player, 'overview', {}) or nil
+    end
     return {
+        plus = plus, bank = { name = Config.BankName, tagline = Config.BankTagline, colour = Config.BankColour, branch = session.terminal.label },
+        fastCash = Config.AtmFastCash,
+        insertedCardId = session.inserted and session.inserted.cardId or '',
         cards = cards, cardError = cardError,
         atmAccountId = session.atmAccountId and tostring(session.atmAccountId) or '',
         characterId = tostring(player.charId), characterName = player.fullName,
@@ -176,13 +182,26 @@ local function move(source, player, action, id, amount, request, token)
         local account, refusal = accountFor(player, id, action == 'deposit' and 'deposit' or 'withdraw')
         if not account then return false, refusal end
         if account.frozen == true or account.frozen == 1 then return false, 'This account is frozen.' end
+        if action ~= 'deposit' then
+            local locked = BankingPlus.lockedWhy(id)
+            if locked then return false, locked end
+        end
         local recipient = session.recipient
         if action == 'transfer' and (not recipient or recipient.token ~= token or recipient.from ~= id
             or recipient.amount ~= amount or recipient.expires <= os.time()) then
             return false, 'Recipient confirmation expired. Find the recipient again.'
         end
         if activeTerminal(source, player) ~= session then return false, 'Banking session ended.' end
-        return handlers[action](source, player, id, amount, action == 'withdraw' and mode or recipient)
+        if mode ~= 'atm' then
+            return handlers[action](source, player, id, amount, action == 'withdraw' and mode or recipient)
+        end
+        -- An ATM: the card's daily limit is claimed first and given back if the cash never comes out.
+        local cardId = session.atmCardId
+        local spent, spendWhy = BankingCards.spend(cardId, amount)
+        if not spent then return false, spendWhy end
+        local done, doneWhy = handlers.withdraw(source, player, id, amount, mode)
+        if not done then BankingCards.unspend(cardId, amount) end
+        return done, doneWhy
     end)
     busy[player.charId] = nil
     if not ran then
@@ -272,6 +291,10 @@ Whip.register(function()
         function(source, player, id, cardId, pin)
             local session, why = activeTerminal(source, player)
             if not session then return false, why end
+            if session.terminal.mode == 'atm' and (not session.inserted or session.inserted.cardId ~= cardId
+                or session.inserted.accountId ~= id) then
+                return false, 'Insert this card into the ATM first.'
+            end
             local account, err = accountFor(player, id, 'withdraw')
             if not account then return false, err end
             local ok, refusal = BankingCards.authorize(source, player, id, cardId, pin)
@@ -280,6 +303,65 @@ Whip.register(function()
             session.atmAccountId, session.atmCardId = id, cardId
             return true
         end)
+
+    -- An ATM: the prompt's point (the client found the prop). The player must stand at it, on foot, in the
+    -- ATM bucket. An ATM only ever pays out the player's own money against their own card and PIN, so a point
+    -- that is not really an ATM gains nothing over the real one.
+    declare('openAtm', 750, { { 'x', 'number', -20000, 20000 }, { 'y', 'number', -20000, 20000 }, { 'z', 'number', -500, 2000 } },
+        function(source, player, x, y, z)
+            local terminal = { mode = 'atm', coords = vector3(x, y, z) }
+            if not near(source, terminal) then return false, 'Move closer to the ATM.' end
+            local session = { terminal = terminal, characterSession = player.session, sequence = 0 }
+            local data, why = snapshot(source, player, session, 0)
+            if not data then return false, why end
+            terminals[source] = session
+            atmOrigins[source] = terminal.coords
+            return data
+        end)
+
+    -- Put a carried card into the machine: it shows in the hand for the insert, then is "in" the ATM until ejected.
+    declare('insertCard', 1000, { accountId, { 'card', 'key', 36 } }, function(source, player, id, cardId)
+        local session, why = activeTerminal(source, player)
+        if not session then return false, why end
+        if session.terminal.mode ~= 'atm' then return false, 'Use an ATM to insert a card.' end
+        if not BankingCards.valid(source, player, id, cardId) then return false, 'This debit card cannot be used.' end
+        session.inserted = { accountId = id, cardId = cardId }
+        session.atmAccountId, session.atmCardId = nil, nil
+        local insert = Config.CardInsertion
+        local held = core:HoldProps(source, { {
+            model = Config.CardProp.model, bone = insert.bone, offset = insert.offset, rot = insert.rotation
+        } }, 'atm-card')
+        if held then
+            local stamp = player.session
+            SetTimeout(insert.duration, function()
+                if core:IsSessionCurrent(source, stamp) then core:DropHeldProps(source, 'atm-card') end
+            end)
+        end
+        return { duration = insert.duration }
+    end)
+
+    declare('ejectCard', 300, {}, function(source, player)
+        local session, why = activeTerminal(source, player)
+        if not session then return false, why end
+        session.inserted, session.atmAccountId, session.atmCardId = nil, nil, nil
+        core:DropHeldProps(source, 'atm-card')
+        return true
+    end)
+
+    -- The new features at a branch: vaults, standing orders, requests, insights, card controls.
+    local branchActions = { overview = true, vaultCreate = true, vaultEdit = true, vaultMove = true, vaultClose = true,
+        scheduleCreate = true, scheduleControl = true, requestPay = true, requestAnswer = true, insights = true,
+        cardControl = true }
+    declare('plus', 600, { { 'action', 'key', 24 }, { 'args', 'any' } }, function(source, player, action, args)
+        local session, why = activeTerminal(source, player)
+        if not session then return false, why end
+        if session.terminal.mode ~= 'bank' then return false, 'Visit a bank branch for this.' end
+        if not branchActions[action] then return false, 'This is not available at the branch.' end
+        local result, err = BankingPlus.run(source, player, action, args)
+        if not result then return false, err end
+        if activeTerminal(source, player) ~= session then return false, 'Banking session ended.' end
+        return result
+    end)
 
     declare('getStatement', 400, { accountId, { 'page', 'id', 1, 1000 } }, function(source, player, id, page)
         local session, why = activeTerminal(source, player)
@@ -334,7 +416,10 @@ Whip.register(function()
             return move(source, player, 'transfer', id, value, request, token)
         end)
     local ok, why = Whip.core:SecureEvent(prefix .. 'close', { rateLimit = 250, burst = 4, whileDead = true },
-        function(source) terminals[source] = nil end)
+        function(source)
+            terminals[source] = nil
+            core:DropHeldProps(source, 'atm-card')
+        end)
     if not ok then print(('[whip_banking] close: %s'):format(why)) end
 end)
 
